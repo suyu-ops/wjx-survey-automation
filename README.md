@@ -98,7 +98,7 @@
 
 | 微信赞赏码 | 支付宝赞赏码 |
 |---|---|
-| ![微信赞赏](assets/donate-1.png) | ![支付宝赞赏](assets/donate-2.jpg) |
+| ![微信赞赏](https://cdn.jsdelivr.net/gh/3975741474/wjx-survey-automation@main/assets/donate-1.png) | ![支付宝赞赏](https://cdn.jsdelivr.net/gh/3975741474/wjx-survey-automation@main/assets/donate-2.jpg) |
 
 > 赞赏完全自愿，不赞赏也不影响任何使用。
 
