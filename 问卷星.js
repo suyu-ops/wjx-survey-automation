@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.6
+// @version      0.1.7
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 0.1.7 - 新增星夜题库资源入口与 QQ 群反馈入口；所有外链均需用户主动点击打开，不传递问卷内容或本地配置。
 // @updateLog 0.1.6 - 清理死代码：移除 fillMatrix 未使用的 weights 形参及其冗余实参；删除从未调用的 handleAliyunCaptchaCheckbox 函数（其能力已由 handleVerification 的轮询逻辑覆盖）。
 // @updateLog 0.1.5 - 修复 19 个 bug：进度弹窗按钮泄漏（排除进度弹窗和 toast）；自动化启动防重入守卫；findQuestionNodes 缓存 TTL 从 16µs 恢复为 16ms；数量模式 checkbox 随机分配考虑最少选择数；fillLocation 选项查找兜底到 body；fillSorting 实现真实排序；fillMatrix 零行不再误判成功；pageSignature 捕获时机后移；pickRandomText 死代码移除；DOM 变化主动失效节点缓存；CSS 修复等。
 // @updateLog 0.1.4 - 优化：添加 clearUsedTextAnswers 清理文本答案缓存；MutationObserver 添加 try/catch 保护；scheduleRescan 错误容错增强。
@@ -158,6 +159,39 @@
             cursor: pointer;
             flex-shrink: 0;
         }
+        #${PANEL_ID} .wjx-head-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        #${PANEL_ID} .wjx-feedback-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 30px;
+            padding: 0 9px;
+            box-sizing: border-box;
+            border-radius: 6px;
+            color: #ffffff;
+            background: linear-gradient(135deg, #12b7f5, #1286e8);
+            box-shadow: 0 4px 10px -5px rgba(18, 134, 232, 0.75);
+            text-decoration: none;
+            font-size: 11px;
+            font-weight: 700;
+            white-space: nowrap;
+            transition: filter 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+        }
+        #${PANEL_ID} .wjx-feedback-link:hover {
+            color: #ffffff;
+            filter: brightness(1.08);
+            transform: translateY(-1px);
+            box-shadow: 0 7px 14px -6px rgba(18, 134, 232, 0.85);
+        }
+        #${PANEL_ID} .wjx-feedback-link:focus-visible {
+            outline: 3px solid rgba(18, 134, 232, 0.25);
+            outline-offset: 2px;
+        }
         .wjx-body {
             padding: 16px;
             overflow-y: auto;
@@ -198,6 +232,84 @@
         .wjx-metric-value {
             font-size: 18px;
             font-weight: 800;
+        }
+        #${PANEL_ID} .wjx-tiku-promo {
+            margin: 0 0 14px;
+            padding: 10px;
+            border: 1px solid rgba(14, 165, 233, 0.30);
+            border-radius: 9px;
+            background: linear-gradient(135deg, rgba(14, 165, 233, 0.09), rgba(16, 185, 129, 0.08));
+            box-shadow: 0 7px 18px -14px rgba(14, 116, 144, 0.52);
+        }
+        #${PANEL_ID} .wjx-tiku-promo-top {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-icon {
+            display: grid;
+            flex: 0 0 30px;
+            width: 30px;
+            height: 30px;
+            place-items: center;
+            border-radius: 9px;
+            color: #0284c7;
+            background: #ffffff;
+            box-shadow: 0 5px 11px -8px rgba(2, 132, 199, 0.65);
+            font-size: 16px;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-copy {
+            display: flex;
+            flex: 1;
+            flex-direction: column;
+            min-width: 0;
+            gap: 1px;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-copy strong {
+            color: #0369a1;
+            font-size: 12.5px;
+            font-weight: 800;
+            line-height: 1.3;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-copy small {
+            color: #52708a;
+            font-size: 10.5px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-actions {
+            display: flex;
+            gap: 7px;
+            margin-top: 9px;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-link {
+            display: inline-flex;
+            flex: 1;
+            align-items: center;
+            justify-content: center;
+            min-height: 29px;
+            padding: 0 8px;
+            border: 1px solid rgba(2, 132, 199, 0.52);
+            border-radius: 7px;
+            color: #0369a1;
+            background: rgba(255, 255, 255, 0.72);
+            text-decoration: none;
+            font-size: 10.5px;
+            font-weight: 800;
+            line-height: 1;
+            transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+        }
+        #${PANEL_ID} .wjx-tiku-promo-link:hover {
+            border-color: #0284c7;
+            color: #ffffff;
+            background: #0284c7;
+            box-shadow: 0 7px 14px -8px rgba(2, 132, 199, 0.68);
+            transform: translateY(-1px);
+        }
+        #${PANEL_ID} .wjx-tiku-promo-link:focus-visible {
+            outline: 3px solid rgba(14, 165, 233, 0.24);
+            outline-offset: 2px;
         }
         .wjx-field {
             display: flex;
@@ -792,7 +904,12 @@
                     <div>
                         <h2 class="wjx-title">问卷星配置面板</h2>
                     </div>
-                    <button type="button" class="wjx-toggle" id="wjx-toggle-panel">收起</button>
+                    <div class="wjx-head-actions">
+                        <a class="wjx-feedback-link"
+                           href="https://qm.qq.com/cgi-bin/qm/qr?k=576pg6G95bKB3A1nGXaUo3pY_xYdeBEW&amp;jump_from=webapi&amp;authKey=VEDKaRZobYLzHSWu87P/RqGVH6E7FiPrCfcNpkBURCDt3TbVCWJ8mUZ3yh3obWIa"
+                           target="_blank" rel="noopener noreferrer" title="加入 QQ 群反馈问题">QQ群反馈</a>
+                        <button type="button" class="wjx-toggle" id="wjx-toggle-panel">收起</button>
+                    </div>
                 </div>
             </div>
             <div class="wjx-body" id="wjx-panel-body">
@@ -806,6 +923,19 @@
                             <span class="wjx-metric-label">题型种类</span>
                             <span class="wjx-metric-value" id="wjx-stat-types">0</span>
                         </div>
+                    </div>
+                </section>
+                <section class="wjx-tiku-promo" aria-label="星夜题库资源入口">
+                    <div class="wjx-tiku-promo-top">
+                        <span class="wjx-tiku-promo-icon" aria-hidden="true">✦</span>
+                        <span class="wjx-tiku-promo-copy">
+                            <strong>星夜题库 · 千万免费题库</strong>
+                            <small>支持 OCS 网课助手接入与配置</small>
+                        </span>
+                    </div>
+                    <div class="wjx-tiku-promo-actions">
+                        <a class="wjx-tiku-promo-link" href="https://tiku888.top/" target="_blank" rel="noopener noreferrer" title="在新标签页打开星夜题库">进入题库 ↗</a>
+                        <a class="wjx-tiku-promo-link" href="https://tiku888.top/guide" target="_blank" rel="noopener noreferrer" title="查看 OCS 网课助手接入说明">OCS 接入说明 ↗</a>
                     </div>
                 </section>
                 <section class="wjx-section">
@@ -880,7 +1010,7 @@
         let offsetX = 0;
         let offsetY = 0;
         head.addEventListener('pointerdown', (event) => {
-            if (event.target.closest('button, input, select')) {
+            if (event.target.closest('a, button, input, select')) {
                 return;
             }
             const rect = panel.getBoundingClientRect();
