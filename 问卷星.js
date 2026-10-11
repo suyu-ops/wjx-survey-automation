@@ -1,8 +1,13 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.7
+// @version      0.1.12
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 0.1.12 - 修复排序题（type=11）间歇性漏填：预览填写入口未复位上一轮自动化留下的停止标志，导致 fillSorting 按 isAutomationInterrupted 提前退出而静默跳过；现在预览入口会重置该标志，且排序题的逐项中断判断只在本题执行期间新出现的中断才收手。
+// @updateLog 0.1.11 - 修复排序题适配代码语法问题，并补充原生排序回调兜底，确保填写状态能同步到问卷星内部答案。
+// @updateLog 0.1.10 - 修复部分页面点击事件未响应：增加 li 原生点击、jQuery 点击和排序状态兜底，确保预览填写时显示排序编号。
+// @updateLog 0.1.9 - 完善排序题校验与兼容：识别问卷星 sortnum 状态、清理残留排序、兼容原生和自定义排序列表，并更新排序题配置提示。
+// @updateLog 0.1.8 - 修复排序题（type=11）填写失效：改为按问卷星真实点击协议逐项选中，点击顺序即排序位，遵循 minvalue/maxvalue 配额，填写前清理上一份残留的排序状态。
 // @updateLog 0.1.7 - 新增星夜题库资源入口与 QQ 群反馈入口；所有外链均需用户主动点击打开，不传递问卷内容或本地配置。
 // @updateLog 0.1.6 - 清理死代码：移除 fillMatrix 未使用的 weights 形参及其冗余实参；删除从未调用的 handleAliyunCaptchaCheckbox 函数（其能力已由 handleVerification 的轮询逻辑覆盖）。
 // @updateLog 0.1.5 - 修复 19 个 bug：进度弹窗按钮泄漏（排除进度弹窗和 toast）；自动化启动防重入守卫；findQuestionNodes 缓存 TTL 从 16µs 恢复为 16ms；数量模式 checkbox 随机分配考虑最少选择数；fillLocation 选项查找兜底到 body；fillSorting 实现真实排序；fillMatrix 零行不再误判成功；pageSignature 捕获时机后移；pickRandomText 死代码移除；DOM 变化主动失效节点缓存；CSS 修复等。
@@ -2133,7 +2138,7 @@
                 ? ''
             : question.type === 'location' || question.type === 'sorting'
                 ? `
-                    <div class="wjx-empty" style="padding:16px 8px;">此题型为随机填写，不支持比例/次数配置。</div>
+                    <div class="wjx-empty" style="padding:16px 8px;">已适配自动随机选取并排序，不使用比例/次数配置。</div>
                 `
                 : `
                     <div class="wjx-grid">
@@ -2311,7 +2316,7 @@
             return '未知题型';
         }
         if (question.type === 'location' || question.type === 'sorting') {
-            return '随机填写，不支持配置';
+            return '自动随机选取并排序，不使用比例/次数配置';
         }
         if (question.type === 'checkbox' && question.minSelections) {
             return `${question.optionLabels.length} 个选项，最少选 ${question.minSelections} 项`;
@@ -3677,48 +3682,227 @@
         return result;
     }
 
+    function getSortingList(node) {
+        return node.querySelector('.ui-controlgroup, .reorder-list, .ui-sortable') || node;
+    }
+
+    function getSortingItems(node) {
+        const list = getSortingList(node);
+        const items = list.querySelectorAll('li.ui-li-static, li.reorder-item, li.ui-sortable-handle, .reorder-item');
+        return Array.from(items)
+            .filter((item) => isElementVisible(item) && cleanText(item.textContent));
+    }
+
+    function isSortingItemChecked(item) {
+        return String(item.getAttribute('check') || '') === '1' || item.classList.contains('check');
+    }
+
+    function readSortingRank(item) {
+        const span = item.querySelector('.sortnum');
+        const rank = span ? Number(cleanText(span.textContent)) || 0 : 0;
+        if (rank) {
+            return rank;
+        }
+        const attrRank = Number(item.getAttribute('data-sort-index') || item.getAttribute('data-rank'));
+        return Number.isFinite(attrRank) && attrRank > 0 ? attrRank : 0;
+    }
+
+    function readSortingValue(item) {
+        const input = item.querySelector('input[type="hidden"]') || item.querySelector('input');
+        return input ? String(input.value) : '';
+    }
+
+    // 排序题的选中标记、排序位都在 li 上，撤选必须走页面运行时的 sortClear
+    function clearSortingItems(node, items) {
+        items.forEach((item) => {
+            if (!isSortingItemChecked(item) && !readSortingRank(item)) {
+                return;
+            }
+            if (typeof window.sortClear === 'function') {
+                try {
+                    window.sortClear(item);
+                    return;
+                } catch (error) {
+                    // 页面运行时函数异常时回落到手工清理
+                }
+            }
+            const span = item.querySelector('.sortnum');
+            if (span) {
+                span.textContent = '';
+                span.classList.remove('sortnum-sel');
+            }
+            item.removeAttribute('check');
+            item.classList.remove('check');
+            item.removeAttribute('data-sort-index');
+            item.removeAttribute('data-rank');
+            const marker = item.querySelector('.aftercheck');
+            if (marker) {
+                marker.remove();
+            }
+        });
+        if (typeof window.sortRestore === 'function' && typeof window.jQuery === 'function') {
+            try {
+                window.sortRestore(window.jQuery(node));
+            } catch (error) {
+                // 恢复原始顺序失败不影响后续点击
+            }
+        }
+    }
+
+    // 页面用全局 window.moveanimate 标记排序动画，动画期间对选项的点击会被直接忽略。
+    // 这里必须自带轮询：waitForCondition 在自动化被中断时会立刻返回，动画没结束就继续点下一项，
+    // 后面的点击会被页面直接丢弃。
+    async function waitSortingSettle() {
+        const deadline = Date.now() + 1600;
+        while (window.moveanimate && Date.now() < deadline) {
+            await sleep(40);
+        }
+        await sleep(60);
+    }
+
+    // 排序题靠真实点击选中：首次点击写入排序位，再次点击取消选中，因此重试次数必须保守
+    function applySortingItemState(item, rank) {
+        const span = item.querySelector('.sortnum');
+        if (span && !readSortingRank(item)) {
+            span.textContent = String(rank);
+            span.classList.add('sortnum-sel');
+        }
+        item.setAttribute('check', '1');
+        item.classList.add('check');
+        if (span) {
+            span.classList.add('sortnum-sel');
+        }
+        if (!item.querySelector('.aftercheck')) {
+            const marker = document.createElement('div');
+            marker.className = 'aftercheck';
+            item.appendChild(marker);
+        }
+        const list = item.parentElement;
+        if (list && list.classList.contains('ui-controlgroup')) {
+            const selectedItems = Array.from(list.querySelectorAll('li.ui-li-static.check, li.reorder-item.check'));
+            selectedItems.sort((left, right) => readSortingRank(left) - readSortingRank(right));
+            selectedItems.forEach((selectedItem, index) => {
+                const selectedSpan = selectedItem.querySelector('.sortnum');
+                if (selectedSpan) {
+                    selectedSpan.textContent = String(index + 1);
+                    selectedSpan.classList.add('sortnum-sel');
+                }
+            });
+        }
+    }
+
+    async function clickSortingItem(item, rank) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (isSortingItemChecked(item)) {
+                if (!readSortingRank(item)) {
+                    applySortingItemState(item, rank);
+                }
+                if (typeof window.sortEvt === 'function' && typeof window.jQuery === 'function') {
+                    try {
+                        window.sortEvt(window.jQuery(getSortingList(item)), item, { preventDefault() {} });
+                    } catch (error) {
+                        logWarning('同步排序题内部答案失败', error);
+                    }
+                }
+                return true;
+            }
+            // 问卷星的 type=11 监听 li 的委托 click；优先点击 li，避免空的 sortnum
+            // span 或隐藏 input 成为事件目标后被页面脚本忽略。
+            item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+            item.click();
+            await waitSortingSettle();
+        }
+        if (isSortingItemChecked(item)) {
+            if (!readSortingRank(item)) {
+                applySortingItemState(item, rank);
+            }
+            return true;
+        }
+
+        // 某些新版页面只在 jQuery 委托事件中处理排序点击。
+        if (typeof window.jQuery === 'function') {
+            try {
+                window.jQuery(item).trigger('click');
+                await waitSortingSettle();
+            } catch (error) {
+                logWarning('触发排序题 jQuery 点击失败', error);
+            }
+        }
+        if (!isSortingItemChecked(item)) {
+            applySortingItemState(item, rank);
+        } else if (!readSortingRank(item)) {
+            applySortingItemState(item, rank);
+        }
+        if (typeof window.sortEvt === 'function' && typeof window.jQuery === 'function') {
+            try {
+                window.sortEvt(window.jQuery(getSortingList(item)), item, {
+                    preventDefault() {}
+                });
+            } catch (error) {
+                logWarning('同步排序题内部答案失败', error);
+            }
+        }
+        return isSortingItemChecked(item) && readSortingRank(item) > 0;
+    }
+
+    function readSortingLimits(node, optionCount) {
+        const minValue = Number(node.getAttribute('minvalue')) || 0;
+        const maxValue = Number(node.getAttribute('maxvalue')) || 0;
+        const minCount = Math.min(Math.max(minValue > 0 ? minValue : node.getAttribute('req') === '1' ? 1 : 0, 0), optionCount);
+        const maxCount = maxValue > 0 ? Math.min(maxValue, optionCount) : optionCount;
+        return {
+            minCount,
+            maxCount: Math.max(minCount, maxCount),
+        };
+    }
+
+    function hasSortingRank(item) {
+        return isSortingItemChecked(item) && readSortingRank(item) > 0;
+    }
+
     async function fillSorting(node) {
-        const items = Array.from(node.querySelectorAll('.reorder-list > li, .ui-sortable > li, .ui-sortable-handle, .reorder-item, ul > li'))
-            .filter((item) => cleanText(item.textContent));
+        const items = getSortingItems(node);
         if (!items.length) {
             return false;
         }
 
-        // 方式一：查找排序输入框（input[type=hidden] 带 order/rank 值）直接写入随机顺序
-        const rankInputs = node.querySelectorAll('input[type="hidden"][name*="order"], input[type="hidden"][name*="rank"], input[type="hidden"][name*="sort"]');
-        if (rankInputs.length === items.length) {
-            const shuffledOrder = fisherYatesShuffle(
-                Array.from({ length: items.length }, (_, i) => i + 1)
-            );
-            rankInputs.forEach((input, index) => {
-                input.value = String(shuffledOrder[index]);
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-            });
-            await scaledDelay(200, 400);
-            return true;
+        clearSortingItems(node, items);
+        await waitSortingSettle();
+
+        const { minCount, maxCount } = readSortingLimits(node, items.length);
+        const upperBound = Math.max(1, Math.min(maxCount, items.length));
+        const targetCount = upperBound >= items.length
+            ? items.length
+            : Math.min(Math.max(randomInt(Math.max(minCount, 1), upperBound), 1), items.length);
+
+        let selected = 0;
+        // 进入本题时若已处于中断态，说明调用来自预览/填到提交前这类非自动化入口，
+        // 不能据此放弃排序；只有本题进行中新出现的中断才需要立刻收手。
+        const interruptedAtEntry = isAutomationInterrupted();
+        for (const item of fisherYatesShuffle(items).slice(0, targetCount)) {
+            if (!interruptedAtEntry && isAutomationInterrupted()) {
+                return selected > 0;
+            }
+            if (await clickSortingItem(item, selected + 1)) {
+                selected += 1;
+            }
+            await scaledDelay(120, 260);
         }
 
-        // 方式二：模拟点击上移/下移按钮打乱顺序
-        const upBtnSelector = '.sort-up, .up, .btn-up, [title*="上移"], [class*="up"]';
-        const downBtnSelector = '.sort-down, .down, .btn-down, [title*="下移"], [class*="down"]';
-        const shuffled = fisherYatesShuffle(items);
-        let moved = false;
-        for (const item of shuffled) {
-            const upBtn = item.querySelector(upBtnSelector);
-            const downBtn = item.querySelector(downBtnSelector);
-            // 随机决定上移或下移，每项移动随机步数
-            const steps = randomInt(1, Math.max(1, Math.floor(items.length / 2)));
-            const useUp = Math.random() > 0.5;
-            for (let s = 0; s < steps; s++) {
-                const btn = useUp ? upBtn : downBtn;
-                if (btn && isElementVisible(btn)) {
-                    btn.click();
-                    await scaledDelay(180, 350);
-                    moved = true;
-                }
-            }
+        if (selected < minCount || !selected) {
+            return false;
         }
-        return moved;
+
+        // 问卷星校验依赖每个已选 li 的排序位；仅检查隐藏值会误把未真正选中的题当成成功。
+        const rankedItems = items
+            .slice()
+            .filter(hasSortingRank)
+            .sort((a, b) => readSortingRank(a) - readSortingRank(b));
+        if (rankedItems.length < minCount || rankedItems.length !== selected) {
+            return false;
+        }
+        return rankedItems.map(readSortingValue).every((value) => value !== '');
     }
 
     function pickWeightedIndex(weights) {
@@ -4888,6 +5072,9 @@
     async function previewFillOnce() {
         syncStateFromDom();
         saveConfig();
+        // 预览填写是独立入口，必须复位上一轮自动化留下的停止标志，
+        // 否则 fillSorting 等按 isAutomationInterrupted 提前退出的路径会静默漏填。
+        clearAutomationStoppedFlag();
         if (!State.config.questions.length) {
             showToast('当前没有可填写的题目配置。');
             return;
