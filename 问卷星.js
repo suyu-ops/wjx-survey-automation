@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.13
+// @version      0.1.14
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 0.1.14 - 风控识别与自我保护：连续多次未通过人机验证时不再空撞，自动暂停并提示「疑似设备/IP 被风控、建议换网络」，避免把风控等级撞高；「设计份数」输入框下方新增份数建议提示，超过 100 份时用醒目样式提醒分批执行；「清除本地数据」按钮扩展为同时清理问卷星的作答残留（wjxanswerdata 等）与设备标识 Cookie（uuuvid / _c_WBKFRo / jac* / SERVERID），并在提示中给出换网络与冷却引导。
 // @updateLog 0.1.13 - 修复手机版（v.wjx.cn）矩阵题填不上：手机版矩阵数据行没有标题列，旧逻辑无条件跳过首列并依赖「行文本非空」判定数据行，导致 6 行全部被跳过、表头行反被当成数据行点击，提交时提示「请回答此题」；现在按 tr[rowindex] 精确取数据行、排除表头/分组行，并按是否存在标题列决定是否跳过首列。同时缓解快速档提交被拦：快速档压缩系数由 0.68 放宽到 0.85，并为快速档加上操作与提交前等待的绝对下限。
 // @updateLog 0.1.12 - 修复排序题（type=11）间歇性漏填：预览填写入口未复位上一轮自动化留下的停止标志，导致 fillSorting 按 isAutomationInterrupted 提前退出而静默跳过；现在预览入口会重置该标志，且排序题的逐项中断判断只在本题执行期间新出现的中断才收手。
 // @updateLog 0.1.11 - 修复排序题适配代码语法问题，并补充原生排序回调兜底，确保填写状态能同步到问卷星内部答案。
@@ -47,6 +48,29 @@
     const QUOTA_STATE_KEY = 'WJX_COUNT_QUOTA_STATE';
     const AUTOMATION_STOPPED_KEY = 'WJX_AUTOMATION_STOPPED';
     const CONFIG_EXPORT_VERSION = 2;
+    // 连续多少次「提交后未通过人机验证」就判定为设备/IP 已被风控并自动暂停。
+    // 问卷星与阿里云验证码的风控判定在服务端，脚本无法绕过，只能尽早收手避免把风控等级撞高。
+    const RISK_CONTROL_VERIFY_FAILURE_LIMIT = 2;
+    const RISK_CONTROL_PAUSE_MESSAGE = '连续多次未通过人机验证，疑似当前网络环境已被问卷星风控；已自动暂停。建议更换网络（换出口 IP）后点「继续」，或等待数小时冷却后再试。';
+    // 问卷星作答残留与设备标识（清缓存治不了根，但换环境后能少一点脏状态）。
+    // 注意 acw_tc 等由 WAF 下发的 HttpOnly Cookie 无法从页面脚本清除，只能靠换网络绕开。
+    const SURVEY_DEVICE_COOKIE_PATTERNS = [
+        /^uuuvid$/i,
+        /^_c_WBKFRo$/i,
+        /^jac\d+$/i,
+        /^SERVERID$/i,
+        /^ASPXANONYMOUS$/i
+    ];
+    const SURVEY_RESIDUE_STORAGE_KEYS = [
+        'wjxanswerdata',
+        'wjxgguid',
+        'wjxsa',
+        'wjxea',
+        'wjxge',
+        'wjxed',
+        'wjxeduloc',
+        'wjxct'
+    ];
     const MAX_AUTO_PAGES = 80;
     const PLACEHOLDER_OPTION_PATTERN = /请选择|请选择项|请选取|please\s*select/i;
     const QUESTION_NODE_SELECTORS = [
@@ -375,6 +399,16 @@
             font-size: 11px;
             line-height: 1.5;
             color: var(--wjx-subtle);
+        }
+        .wjx-count-hint {
+            margin: 6px 0 0;
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--wjx-subtle);
+        }
+        .wjx-count-hint.is-warning {
+            color: #d4380d;
+            font-weight: 700;
         }
         .wjx-actions {
             display: grid;
@@ -839,6 +873,7 @@
             remaining -= 1;
             session.remaining = remaining;
             session.retryCount = 0;
+            session.verifyFailures = 0;
             session.lastError = '';
             session.attemptQuotaSnapshot = null;
             session.completionHandled = true;
@@ -949,6 +984,7 @@
                     <div class="wjx-field">
                         <label for="wjx-target-count">设计份数</label>
                         <input id="wjx-target-count" class="wjx-input" type="number" min="1" step="1" value="1" />
+                        <p class="wjx-count-hint" id="wjx-count-hint" aria-live="polite"></p>
                     </div>
                     <div class="wjx-field">
                         <label>分配模式</label>
@@ -1076,6 +1112,7 @@
 
         panel.querySelector('#wjx-target-count').addEventListener('input', (event) => {
             State.config.targetCount = Math.max(1, Number(event.target.value) || 1);
+            updateTargetCountHint();
             updateCountModeHints();
             scheduleConfigSave();
         });
@@ -1245,6 +1282,7 @@
         if (targetInput) {
             targetInput.value = String(State.config.targetCount);
         }
+        updateTargetCountHint();
         const speedInput = document.getElementById('wjx-speed-profile');
         if (speedInput) {
             speedInput.value = ['slow', 'normal', 'fast'].includes(State.config.speedProfile)
@@ -1537,6 +1575,7 @@
         if (targetInput) {
             targetInput.value = String(State.config.targetCount);
         }
+        updateTargetCountHint();
         const speedInput = document.getElementById('wjx-speed-profile');
         if (speedInput) {
             speedInput.value = State.config.speedProfile;
@@ -1773,6 +1812,27 @@
             return depth;
         };
         return cards.slice().sort((left, right) => relationDepth(left) - relationDepth(right));
+    }
+
+    // 建议单次不超过 100 份：问卷星与阿里云验证码会按设备/IP 做提交频率风控，
+    // 一次跑太多份很容易在中途被拦（表现为「连续多次未通过人机验证」）。
+    // 这里只做提示，不限制输入上限，用户仍可自行承担风险填更大数字。
+    const TARGET_COUNT_ADVICE = 100;
+
+    function updateTargetCountHint() {
+        const hint = document.getElementById('wjx-count-hint');
+        if (!hint) {
+            return;
+        }
+        const input = document.getElementById('wjx-target-count');
+        const count = Math.max(1, Number(input && input.value) || 1);
+        if (count > TARGET_COUNT_ADVICE) {
+            hint.classList.add('is-warning');
+            hint.textContent = `建议单次不超过 ${TARGET_COUNT_ADVICE} 份：本问卷一次跑 ${count} 份，容易被问卷星按设备/IP 判定风控而卡在人机验证。建议分批执行（例如每次 50～100 份），中间换网络或间隔一段时间。`;
+            return;
+        }
+        hint.classList.remove('is-warning');
+        hint.textContent = `建议单次不超过 ${TARGET_COUNT_ADVICE} 份；需要更多份数时建议分批执行。`;
     }
 
     function updateCountModeHints() {
@@ -2284,16 +2344,55 @@
         showToast('已恢复当前问卷默认配置。');
     }
 
+    // 清理问卷星自身的作答残留与设备标识 Cookie。
+    // 说明：真正参与风控的 acw_tc、.ASPXANONYMOUS 由服务端/WAF 以 HttpOnly 下发，
+    // 页面脚本改不了；这里能清的是脚本可写的那几个（uuuvid、_c_WBKFRo、jac* 等），
+    // 换网络后用得上，避免带着旧环境状态直接重试。
+    function clearSurveyDeviceState() {
+        const clearedCookies = [];
+        for (const key of SURVEY_RESIDUE_STORAGE_KEYS) {
+            try {
+                localStorage.removeItem(key);
+            } catch (error) {}
+        }
+        const host = location.hostname;
+        const domains = [host, '.' + host, host.replace(/^[^.]+\./, '.'), ''];
+        let cookieNames = [];
+        try {
+            cookieNames = String(document.cookie || '')
+                .split(';')
+                .map((part) => part.split('=')[0].trim())
+                .filter(Boolean);
+        } catch (error) {}
+        for (const name of cookieNames) {
+            if (!SURVEY_DEVICE_COOKIE_PATTERNS.some((pattern) => pattern.test(name))) {
+                continue;
+            }
+            for (const domain of domains) {
+                const domainPart = domain ? `; domain=${domain}` : '';
+                try {
+                    document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/${domainPart}`;
+                } catch (error) {}
+            }
+            clearedCookies.push(name);
+        }
+        return { cookies: Array.from(new Set(clearedCookies)), storages: SURVEY_RESIDUE_STORAGE_KEYS.slice() };
+    }
+
     function clearCurrentSurveyStorage() {
-        if (!window.confirm('清除当前问卷配置、进度和配额数据？')) {
+        if (!window.confirm('清除当前问卷配置、进度和配额数据？（同时清理问卷星的作答残留与设备标识 Cookie）')) {
             return;
         }
         localStorage.removeItem(State.surveyKey);
         clearAutomationStorage();
         clearAutomationStoppedFlag();
+        const deviceState = clearSurveyDeviceState();
         refreshQuestions({ silent: true, preserveInputs: false });
         setSaveStatus('本地数据已清除', 'saved');
-        showToast('当前问卷的本地数据已清除。');
+        const cookieText = deviceState.cookies.length
+            ? `已清理 Cookie：${deviceState.cookies.join('、')}。`
+            : '未发现可清理的设备标识 Cookie。';
+        showToast(`当前问卷的本地数据已清除。${cookieText}若仍被人机验证拦截，请更换网络（换出口 IP）后重试。`, { duration: 8000 });
     }
 
     function buildQuestionMeta(question) {
@@ -2969,6 +3068,29 @@
         return !isAutomationInterrupted() && isAutomationActive();
     }
 
+    // 记录一次「提交后未通过人机验证」。连续达到阈值即判定为设备/IP 已被风控并自动暂停，
+    // 返回 true 表示本次已暂停，调用方必须立刻收手，不要再走重试（否则会把风控等级撞高）。
+    function noteVerificationFailure() {
+        const session = loadAutomationSession();
+        if (!session) {
+            return false;
+        }
+        session.verifyFailures = Math.max(0, Number(session.verifyFailures) || 0) + 1;
+        if (session.verifyFailures < RISK_CONTROL_VERIFY_FAILURE_LIMIT) {
+            saveAutomationSession(session);
+            return false;
+        }
+        session.verifyFailures = 0;
+        session.paused = true;
+        // 清零重试计数，避免暂停后状态栏还显示「已重试 N 次」造成误解。
+        session.retryCount = 0;
+        session.lastError = '疑似当前设备/IP 已被风控';
+        saveAutomationSession(session);
+        updateAutomationProgress();
+        showToast(RISK_CONTROL_PAUSE_MESSAGE, { duration: 9000 });
+        return true;
+    }
+
     function injectProgressStyles() {
         if (progressStyleInjected || document.querySelector('style[data-wjx-progress]')) {
             progressStyleInjected = true;
@@ -3374,6 +3496,7 @@
             failed: 0,
             paused: false,
             retryCount: 0,
+            verifyFailures: 0,
             maxRetries: 2,
             attemptQuotaSnapshot: null,
             completionHandled: false,
@@ -3556,6 +3679,16 @@
                     // 在此累加会让进度框在重试期间显示「失败 N 份」放大失败数。
                     if (result && result.reason === 'no-submit-button') {
                         throw new Error('进入提交分支后仍未找到提交按钮');
+                    }
+                    if (result && result.verificationFailed) {
+                        // 服务端按设备/IP 风控：先把本次计入风控失败数，达阈值则暂停并由上层收手，
+                        // 不能让它落进「重试 2 次」的老路，否则只会把风控等级撞得更高。
+                        if (noteVerificationFailure()) {
+                            return { submitted: false, riskControlled: true };
+                        }
+                        const verificationError = new Error('进入提交分支后提交未成功（可能验证码未通过）');
+                        verificationError.verificationFailed = true;
+                        throw verificationError;
                     }
                     throw new Error('进入提交分支后提交未成功（可能验证码未通过）');
                 }
@@ -4930,7 +5063,7 @@
         }
         // 提交按钮仍在且没跳转 => 大概率验证码未通过 / 提交被拒
         logWarning('提交未确认完成', { verificationHandled, stillHasSubmit: !!getSubmitButton() });
-        return { ok: false, reason: 'verification-failed', verificationFailed: !verificationHandled };
+        return { ok: false, reason: 'verification-failed', verificationFailed: true };
     }
 
     async function runOneAutomationSubmission() {
@@ -4948,6 +5081,10 @@
 
             const result = await fillAllQuestions();
             if (!isAutomationStillActive()) {
+                return;
+            }
+            if (result && result.riskControlled) {
+                // 已被风控判定并自动暂停，切勿再走下面的重试分支。
                 return;
             }
             if (result && result.submitted) {
@@ -4971,6 +5108,11 @@
                 }
                 // 验证失败：不累计 failed，交给上层 catch 走重试。
                 // failed 仅在用户主动「跳过当前份」时累加，避免重试期间放大失败计数。
+                // 但连续多次验证失败通常是服务端按设备/IP 风控（脚本无法绕过），
+                // 此时继续空撞只会把风控等级撞得更高，因此计数到阈值就主动暂停。
+                if (submitResult.verificationFailed && noteVerificationFailure()) {
+                    return;
+                }
                 throw new Error('提交未成功（可能验证码未通过）');
             }
 
@@ -5020,6 +5162,7 @@
         remaining = Math.max(0, remaining - 1);
         session.remaining = remaining;
         session.retryCount = 0;
+        session.verifyFailures = 0;
         session.lastError = '';
         session.attemptQuotaSnapshot = null;
         session.completionHandled = false;
