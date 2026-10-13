@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.12
+// @version      0.1.13
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 0.1.13 - 修复手机版（v.wjx.cn）矩阵题填不上：手机版矩阵数据行没有标题列，旧逻辑无条件跳过首列并依赖「行文本非空」判定数据行，导致 6 行全部被跳过、表头行反被当成数据行点击，提交时提示「请回答此题」；现在按 tr[rowindex] 精确取数据行、排除表头/分组行，并按是否存在标题列决定是否跳过首列。同时缓解快速档提交被拦：快速档压缩系数由 0.68 放宽到 0.85，并为快速档加上操作与提交前等待的绝对下限。
 // @updateLog 0.1.12 - 修复排序题（type=11）间歇性漏填：预览填写入口未复位上一轮自动化留下的停止标志，导致 fillSorting 按 isAutomationInterrupted 提前退出而静默跳过；现在预览入口会重置该标志，且排序题的逐项中断判断只在本题执行期间新出现的中断才收手。
 // @updateLog 0.1.11 - 修复排序题适配代码语法问题，并补充原生排序回调兜底，确保填写状态能同步到问卷星内部答案。
 // @updateLog 0.1.10 - 修复部分页面点击事件未响应：增加 li 原生点击、jQuery 点击和排序状态兜底，确保预览填写时显示排序编号。
@@ -2855,20 +2856,26 @@
             return { optionLabels: ['选项1', '选项2'], rowCount: 0 };
         }
 
+        // 手机版（v.wjx.cn）矩阵首行是 tbody 里的 tr.trlabel，首列不是空占位列；
+        // 桌面版首行首列是空 <th></th>。统一按「首列文本是否为空」决定是否跳过，
+        // 否则手机版会把第一列标签（如「非常不满意」）整体丢掉。
         let headerCells = [];
         const theadCells = table.querySelectorAll('thead tr:first-child th, thead tr:first-child td');
         if (theadCells.length > 1) {
-            headerCells = Array.from(theadCells).slice(1);
+            headerCells = Array.from(theadCells);
         } else {
-            const firstRow = table.querySelector('tbody tr, tr');
+            const firstRow = table.querySelector('tbody tr.trlabel') || table.querySelector('tbody tr, tr');
             const bodyCells = firstRow ? firstRow.querySelectorAll('td, th') : [];
             if (bodyCells.length > 1) {
-                headerCells = Array.from(bodyCells).slice(1);
+                headerCells = Array.from(bodyCells);
             }
+        }
+        if (headerCells.length > 1 && !cleanText(headerCells[0].textContent)) {
+            headerCells = headerCells.slice(1);
         }
 
         const optionLabels = dedupeTexts(headerCells.map((cell) => trimOptionPrefix(cleanText(cell.textContent)))).filter(Boolean);
-        const rowCount = table.querySelectorAll('tbody tr').length || Math.max(0, table.querySelectorAll('tr').length - 1);
+        const rowCount = getMatrixDataRows(table).length;
         return {
             optionLabels: optionLabels.length ? optionLabels : ['选项1', '选项2'],
             rowCount
@@ -4243,18 +4250,31 @@
         return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
+    // 快速档只压缩「等待」，不能把操作密度一起压掉。
+    // 实测：原 fast=0.68 会把提交前的 800~1500ms 压到 540~1020ms，
+    // 问卷星人机验证直接判定为机器操作并拦下（同一问卷正常/慢速都能过）。
+    // 现在把系数放宽到 0.85，并对快速档做双边约束：
+    //   不低于下限（提交前 1300ms / 其它操作 220ms）—— 避免被判定为机器；
+    //   不高于正常档的等待时长 —— 保持「快速」语义，绝不比正常档慢。
+    const SPEED_FACTORS = { slow: 1.45, normal: 1, fast: 0.85 };
+    const FAST_MIN_SUBMIT_DELAY_MS = 1300;
+    const FAST_MIN_ACTION_DELAY_MS = 220;
+
     function getSpeedFactor() {
-        if (State.config.speedProfile === 'slow') {
-            return 1.45;
-        }
-        if (State.config.speedProfile === 'fast') {
-            return 0.68;
-        }
-        return 1;
+        const profile = State.config.speedProfile;
+        return Object.prototype.hasOwnProperty.call(SPEED_FACTORS, profile)
+            ? SPEED_FACTORS[profile]
+            : 1;
     }
 
     function scaledDelay(min, max) {
-        return sleep((min + Math.random() * (max - min)) * getSpeedFactor());
+        const factor = getSpeedFactor();
+        const base = min + Math.random() * (max - min);
+        if (factor >= 1) {
+            return sleep(base * factor);
+        }
+        const floor = min >= 800 ? FAST_MIN_SUBMIT_DELAY_MS : FAST_MIN_ACTION_DELAY_MS;
+        return sleep(Math.min(Math.max(base * factor, floor), base));
     }
 
     function getChoiceElements(node, type) {
@@ -4443,6 +4463,25 @@
         return true;
     }
 
+    // 取矩阵题真正可作答的数据行。
+    // 有 rowindex 属性时直接用它；没有时才退化为 tbody tr，并排除表头行 trlabel
+    // 与分组标题行 rowtitle —— 它们不是数据行，混进来会让 fillMatrix 误判失败。
+    function getMatrixDataRows(scope) {
+        if (!scope) {
+            return [];
+        }
+        const indexed = Array.from(scope.querySelectorAll('tr[rowindex]'));
+        if (indexed.length) {
+            return indexed;
+        }
+        return Array.from(scope.querySelectorAll('tbody tr, tr')).filter((row) => {
+            if (row.classList.contains('trlabel') || row.classList.contains('rowtitle')) {
+                return false;
+            }
+            return row.querySelectorAll('td, th').length > 0;
+        });
+    }
+
     function getMatrixQuotaRowIndex(row, fallbackIndex) {
         const raw = row.getAttribute('rowindex');
         if (raw !== null && raw !== '') {
@@ -4463,7 +4502,17 @@
         if (rateAnchors.length) {
             return rateAnchors;
         }
-        const cells = Array.from(row.querySelectorAll('td, th')).slice(1);
+        // 只有桌面版数据行才带标题列；手机版数据行第一格就是第一个选项，
+        // 无条件 slice(1) 会吃掉首列并把整行选项右移一格。
+        let cells = Array.from(row.querySelectorAll('td, th'));
+        const firstCell = cells[0];
+        const hasTitleCell = !!firstCell && (
+            firstCell.matches('.scalerowtitletd') ||
+            !!firstCell.querySelector('.scalerowtitletd, .rowtitlediv, .itemTitleSpan')
+        );
+        if (hasTitleCell) {
+            cells = cells.slice(1);
+        }
         return cells.filter((cell) =>
             cell.querySelector('input[type="radio"], input[type="checkbox"], .ui-radio, .ui-checkbox, a[dval], .rate-off, .rate-on') ||
             cleanText(cell.textContent)
@@ -4471,11 +4520,13 @@
     }
 
     function fillMatrix(node, question) {
-        const rows = node.querySelectorAll('tr[rowindex], tbody tr');
+        const rows = getMatrixDataRows(node);
         let attempted = 0;
         let succeeded = 0;
         rows.forEach((row, domIndex) => {
-            if (!cleanText(row.textContent)) {
+            // 手机版数据行的单元格里只有 <a class="rate-off">，没有任何文本，
+            // 不能再用「行文本非空」当作数据行判据（那会把 6 行全跳过）。
+            if (!getMatrixRowOptions(row).length) {
                 return;
             }
             attempted += 1;
