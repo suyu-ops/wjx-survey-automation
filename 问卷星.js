@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.14
+// @version      0.1.15
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 0.1.15 - 新增占比题（type=12）支持：此前该题型被兜底识别成填空题，填充词库文本导致提交被拦；现在按行的 issum 输入框精确识别、读出题目 total 作为合计目标、按权重分配并补齐取整误差后写入，同时同步滑块视觉位置，面板显示「占比题 / N 个占比项，合计 100」，题型筛选新增占比题。同时修复带封面页的问卷「多一步进入」：封面入口 #slideChunk 不是 a/button，此前不在可见按钮候选里，导致预览/自动化报「未识别到题目页或开始按钮」；现在优先识别并点击封面入口再等题目页出现。
 // @updateLog 0.1.14 - 风控识别与自我保护：连续多次未通过人机验证时不再空撞，自动暂停并提示「疑似设备/IP 被风控、建议换网络」，避免把风控等级撞高；「设计份数」输入框下方新增份数建议提示，超过 100 份时用醒目样式提醒分批执行；「清除本地数据」按钮扩展为同时清理问卷星的作答残留（wjxanswerdata 等）与设备标识 Cookie（uuuvid / _c_WBKFRo / jac* / SERVERID），并在提示中给出换网络与冷却引导。
 // @updateLog 0.1.13 - 修复手机版（v.wjx.cn）矩阵题填不上：手机版矩阵数据行没有标题列，旧逻辑无条件跳过首列并依赖「行文本非空」判定数据行，导致 6 行全部被跳过、表头行反被当成数据行点击，提交时提示「请回答此题」；现在按 tr[rowindex] 精确取数据行、排除表头/分组行，并按是否存在标题列决定是否跳过首列。同时缓解快速档提交被拦：快速档压缩系数由 0.68 放宽到 0.85，并为快速档加上操作与提交前等待的绝对下限。
 // @updateLog 0.1.12 - 修复排序题（type=11）间歇性漏填：预览填写入口未复位上一轮自动化留下的停止标志，导致 fillSorting 按 isAutomationInterrupted 提前退出而静默跳过；现在预览入口会重置该标志，且排序题的逐项中断判断只在本题执行期间新出现的中断才收手。
@@ -102,6 +103,7 @@
         slide: '滑块题',
         location: '地区题',
         sorting: '排序题',
+        proportion: '占比题',
         unknown: '未知题型'
     };
 
@@ -1032,6 +1034,7 @@
                             <option value="text">填空题</option>
                             <option value="location">地区题</option>
                             <option value="sorting">排序题</option>
+                            <option value="proportion">占比题</option>
                         </select>
                     </div>
                     <div id="wjx-question-list" class="wjx-list"></div>
@@ -1513,6 +1516,7 @@
                 : [],
             minScore: clampScore(question.minScore, 1),
             maxScore: clampScore(question.maxScore, 100),
+            proportionTotal: Math.max(1, Number(question.proportionTotal) || 100),
             relations: Array.isArray(question.relations)
                 ? question.relations.slice(0, 100).map((relation) => ({
                     topicId: String(relation && relation.topicId || ''),
@@ -1636,7 +1640,10 @@
         }
     }
 
-    function getWeightInputSuffix() {
+    function getWeightInputSuffix(type) {
+        if (type === 'proportion') {
+            return '占比';
+        }
         return isCountMode() ? '次数' : '比例';
     }
 
@@ -1662,6 +1669,11 @@
                 total *= minSel;
             }
             return distributeCountsEvenly(optionCount, total);
+        }
+        // 占比题的合计由题目上的 total 决定，不是固定 100。
+        if (question && question.type === 'proportion') {
+            const total = Math.max(1, Number(question.proportionTotal) || 100);
+            return distributeRatiosToTotal(optionCount, total);
         }
         return distributeRatiosToTotal(optionCount, 100);
     }
@@ -2205,7 +2217,7 @@
                     <div class="wjx-grid">
                         ${question.optionLabels.map((label, index) => `
                             <div class="wjx-grid-item">
-                                <span title="${escapeHtml(label)}">${escapeHtml(label)}（${getWeightInputSuffix()}）</span>
+                                <span title="${escapeHtml(label)}">${escapeHtml(label)}（${getWeightInputSuffix(question.type)}）</span>
                                 <input type="number" min="0" step="1" value="${escapeHtml(String(weights[index] || 0))}" data-role="weight-input" data-index="${index}" />
                                 <div class="wjx-weight-bar-wrap" aria-hidden="true"><div class="wjx-weight-bar" style="width:${weightTotal > 0 ? Math.round((Math.max(0, Number(weights[index]) || 0) / weightTotal) * 100) : 0}%"></div></div>
                             </div>
@@ -2216,9 +2228,9 @@
             ? '<button type="button" class="wjx-chip" data-preset="text-default">填入默认词库</button>'
             : question.type === 'slide'
                 ? '<button type="button" class="wjx-chip" data-preset="slide-default">随机分值区间</button>'
-                : question.type === 'unknown' || question.type === 'location' || question.type === 'sorting'
+            : question.type === 'unknown' || question.type === 'location' || question.type === 'sorting'
                     ? ''
-                    : `<button type="button" class="wjx-chip" data-preset="random">${getRandomPresetLabel()}</button>`;
+                    : `<button type="button" class="wjx-chip" data-preset="random">${question.type === 'proportion' ? '随机比例' : getRandomPresetLabel()}</button>`;
         const tools = `
             <div class="wjx-tools">
                 ${presetTool}
@@ -2231,8 +2243,12 @@
         const countHint = isCountMode() && supportsCountDistribution(question.type) && question.type !== 'checkbox'
             ? `<div class="wjx-count-hint${formatCountSumOnlyHint(question) ? '' : ' wjx-hidden'}" data-role="count-expected-hint">${escapeHtml(formatCountSumOnlyHint(question))}</div>`
             : '';
+        const summaryTotal = question.type === 'proportion'
+            ? Math.max(1, Number(question.proportionTotal) || 100)
+            : Math.round(weightTotal);
+        const summarySuffix = question.type === 'proportion' ? '' : (isCountMode() ? ' 次' : '');
         const summary = question.type !== 'text' && question.type !== 'slide' && question.type !== 'unknown' && question.type !== 'location' && question.type !== 'sorting'
-            ? `<div class="wjx-weight-summary" data-role="weight-summary">合计 ${Math.round(weightTotal)}${isCountMode() ? ' 次' : ''}</div>`
+            ? `<div class="wjx-weight-summary" data-role="weight-summary">合计 ${summaryTotal}${summarySuffix}</div>`
             : '';
 
         return `
@@ -2415,6 +2431,10 @@
         if (question.type === 'unknown') {
             return '未知题型';
         }
+        if (question.type === 'proportion') {
+            const total = Math.max(1, Number(question.proportionTotal) || 100);
+            return `${question.optionLabels.length} 个占比项，合计 ${total}`;
+        }
         if (question.type === 'location' || question.type === 'sorting') {
             return '自动随机选取并排序，不使用比例/次数配置';
         }
@@ -2452,6 +2472,7 @@
                 rowCount: original.rowCount || 0,
                 minSelections: original.minSelections || 0,
                 maxSelections: original.maxSelections || 0,
+                proportionTotal: Math.max(1, Number(original.proportionTotal) || 100),
                 enabled: original.enabled !== false,
                 minScore: clampScore(original.minScore, 1),
                 maxScore: clampScore(original.maxScore, 100)
@@ -2524,6 +2545,19 @@
             showToast('已设置为偏向高分，仅保留高星级权重。');
             return;
         }
+        // 占比题在需要时用生成器的随机比例，但合计必须等于题目上的 total。
+        if (original.type === 'proportion') {
+            const total = Math.max(1, Number(original.proportionTotal) || 100);
+            const values = distributeRatiosToTotal(inputs.length, total);
+            inputs.forEach((input, index) => {
+                input.value = String(values[index] || 0);
+            });
+            syncQuestionWeightsFromCard(card);
+            updateWeightVisuals(card);
+            showToast(`已生成随机占比，合计 ${total}。`);
+            return;
+        }
+
         const values = buildRandomWeightValues(getQuestionWeightInputCount(card, original), original);
         inputs.forEach((input, index) => {
             input.value = String(values[index] || 0);
@@ -2561,8 +2595,7 @@
                 return;
             }
             const original = findQuestionByCard(card) || { relations: [] };
-            const values = buildRandomWeightValues(getQuestionWeightInputCount(card, original), original);
-            card.querySelectorAll('[data-role="weight-input"]').forEach((input, index) => {
+            const values = buildRandomWeightValues(getQuestionWeightInputCount(card, original), original);            card.querySelectorAll('[data-role="weight-input"]').forEach((input, index) => {
                 input.value = String(values[index] || 0);
             });
             syncQuestionWeightsFromCard(card);
@@ -2766,6 +2799,19 @@
             return Object.assign(base, { optionLabels: [], weights: [] });
         }
 
+        // 占比题：各行数值由 total（默认 100）决定，权重即各行占比，
+        // 必须合计恰好等于 total，因此按份额生成而不是自由填数。
+        if (type === 'proportion') {
+            const labels = extractProportionLabels(node);
+            const total = readProportionTotal(node);
+            return Object.assign(base, {
+                optionLabels: labels.length ? labels : ['项目1', '项目2'],
+                rowCount: labels.length,
+                proportionTotal: total,
+                weights: distributeRatiosToTotal(labels.length || 2, total)
+            });
+        }
+
         const detail = extractDetail(node, type);
         const limits = extractSelectionLimits(node, type, detail.optionLabels.length);
         return Object.assign(base, {
@@ -2815,6 +2861,14 @@
         }
         if (wjxType === '8') {
             return 'slide';
+        }
+        // 占比题（比重题）：题目属性带 total（各行必须合计等于它），
+        // 行内是 issum=1 的滑动输入框，不是普通填空题。
+        if (wjxType === '12') {
+            return 'proportion';
+        }
+        if (node.getAttribute('total') && node.querySelector('input[issum="1"], table.matrix-rating')) {
+            return 'proportion';
         }
         if (node.querySelector('.div_table_radio_question, .div_table_clear_top')) {
             return 'matrix';
@@ -2866,7 +2920,37 @@
         return { minSelections, maxSelections };
     }
 
+    // 占比题只读结果行标题：标题行 tr#drv12_Nt 内的 td.title，数据行只含输入框。
+    function extractProportionLabels(node) {
+        const titleCells = Array.from(node.querySelectorAll('tr[id$="t"] td.title, tr[id$="t"] td'));
+        const labels = titleCells
+            .map((cell) => trimOptionPrefix(cleanText(cell.textContent)))
+            .filter(Boolean);
+        if (labels.length) {
+            return dedupeTexts(labels).slice(0, 50);
+        }
+        const fallback = Array.from(node.querySelectorAll('table tr'))
+            .filter((row) => !row.querySelector('input'))
+            .map((row) => trimOptionPrefix(cleanText(row.textContent)))
+            .filter(Boolean);
+        return dedupeTexts(fallback).slice(0, 50);
+    }
+
+    // 占比题要求各行之和恰好等于题目上的 total（卷面一般是 100）。
+    function readProportionTotal(node) {
+        const raw = node && node.getAttribute ? Number(node.getAttribute('total')) : NaN;
+        return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 100;
+    }
+
     function extractDetail(node, type) {
+        if (type === 'proportion') {
+            const optionLabels = extractProportionLabels(node);
+            return {
+                optionLabels: optionLabels.length ? optionLabels : ['项目1', '项目2'],
+                rowCount: optionLabels.length
+            };
+        }
+
         if (type === 'dropdown') {
             const select = node.querySelector('select');
             const optionLabels = Array.from(select ? select.options : [])
@@ -3738,6 +3822,8 @@
                 return await fillLocation(node);
             case 'sorting':
                 return await fillSorting(node);
+            case 'proportion':
+                return fillProportion(node, question);
             default:
                 return false;
         }
@@ -4158,13 +4244,27 @@
 
     function getVisibleActionButtons() {
         return Array.from(document.querySelectorAll(
-            '#divNext, #ctlNext, #divStart, #submit_button, .submitbutton, .btn-submit, .nextbutton, .prevbutton, a.button, .button, button, input[type="button"], input[type="submit"], [onclick*="next"], [onclick*="Next"], [onclick*="page"], [onclick*="Page"], [id*="Next"], [id*="next"]'
+            '#divNext, #ctlNext, #divStart, #submit_button, .submitbutton, .btn-submit, .nextbutton, .prevbutton, a.button, .button, button, input[type="button"], input[type="submit"], [onclick*="next"], [onclick*="Next"], [onclick*="page"], [onclick*="Page"], [id*="Next"], [id*="next"], #slideChunk, #CoverStartGroup'
         )).filter((button) => {
             return isNodeVisible(button)
                 && !button.closest(`#${PANEL_ID}`)
                 && !button.closest('.wjx-progress-modal')
                 && !button.closest('.wjx-toast');
         });
+    }
+
+    // 封面页（有卷首说明/图片的问卷）的「开始作答」入口。
+    // 它不是 a/button/input，而是 #CoverStartGroup 里的 #slideChunk，
+    // 点击事件由 coverEffect_new.js 通过 jQuery 委托绑定，因此必须原生点它本身。
+    function getVisibleCoverEntry() {
+        const candidates = ['#slideChunk', '#CoverStartGroup', '.slideChunkWord'];
+        for (const selector of candidates) {
+            const element = document.querySelector(selector);
+            if (element && isNodeVisible(element)) {
+                return element;
+            }
+        }
+        return null;
     }
 
     function isNextButtonText(text) {
@@ -4184,6 +4284,12 @@
     }
 
     function getCoverStartButton() {
+        // 封面入口优先：有它时页面上的 #divNext/#ctlNext 往往还在 DOM 里但不可见，
+        // 直接返回封面入口，避免误判成「没有开始按钮」。
+        const coverEntry = getVisibleCoverEntry();
+        if (coverEntry) {
+            return coverEntry;
+        }
         return getVisibleActionButtons().find((button) => {
             const text = getButtonText(button);
             if (button.matches('#divStart')) {
@@ -4594,6 +4700,90 @@
             visibleDisplay.textContent = String(value);
         }
         return true;
+    }
+
+    // 取占比题真正可作答的输入框：带 issum 属性的滑动输入，
+    // 没有该属性时退化为行内 input[type=text]（排除隐藏域）。
+    function getProportionInputs(node) {
+        if (!node) {
+            return [];
+        }
+        const marked = Array.from(node.querySelectorAll('input[issum="1"]'));
+        if (marked.length) {
+            return marked;
+        }
+        return Array.from(node.querySelectorAll('input[type="text"], input[type="number"]'))
+            .filter((input) => !input.classList.contains('OtherText'));
+    }
+
+    // 占比题：所有行的数值必须恰好合计等于题目上的 total，否则问卷星校验不过。
+    // 先按配置权重分配，再把取整误差补到最大项，并同步 rangeslider 的视觉位置。
+    function fillProportion(node, question) {
+        const inputs = getProportionInputs(node);
+        if (!inputs.length) {
+            return false;
+        }
+        const total = readProportionTotal(node);
+        const labels = Array.isArray(question && question.optionLabels) ? question.optionLabels : [];
+        const weights = Array.isArray(question && question.weights) && question.weights.length === inputs.length
+            ? question.weights
+            : distributeRatiosToTotal(inputs.length, total);
+
+        const values = weights.map((value) => {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : 0;
+        });
+        let diff = values.reduce((sum, value) => sum + value, 0) - total;
+        while (diff !== 0) {
+            let extremum = 0;
+            for (let i = 1; i < values.length; i++) {
+                if (diff > 0 ? values[i] > values[extremum] : values[i] < values[extremum]) {
+                    extremum = i;
+                }
+            }
+            const step = diff > 0 ? -1 : 1;
+            if (values[extremum] + step < 0) {
+                break;
+            }
+            values[extremum] += step;
+            diff += step;
+        }
+
+        let filled = false;
+        inputs.forEach((input, index) => {
+            const value = String(values[index] || 0);
+            input.value = value;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            syncProportionSliderVisual(input, value, total);
+            if (!filled && value !== '0') {
+                filled = true;
+            }
+            if (labels[index] && !input.getAttribute('aria-label')) {
+                input.setAttribute('aria-label', labels[index]);
+            }
+        });
+        return filled || values.some((value) => value > 0);
+    }
+
+    // rangeslider 由脚本单独渲染，改 input.value 不会自动移动手柄，
+    // 这里按比例补一次视觉同步，避免用户看到输入值与滑块不一致。
+    function syncProportionSliderVisual(input, value, total) {
+        const wrapper = input.parentElement && input.parentElement.querySelector('.rangeslider');
+        if (!wrapper) {
+            return;
+        }
+        const numeric = Number(value);
+        const percent = total > 0 ? Math.min(100, Math.max(0, (numeric / total) * 100)) : 0;
+        const fill = wrapper.querySelector('.rangeslider__fill');
+        const handle = wrapper.querySelector('.rangeslider__handle');
+        if (fill) {
+            fill.style.width = `${percent}%`;
+        }
+        if (handle) {
+            handle.style.left = `${percent}%`;
+            handle.setAttribute('data-value', String(numeric));
+        }
     }
 
     // 取矩阵题真正可作答的数据行。
