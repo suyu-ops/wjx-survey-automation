@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.15
+// @version      0.1.18
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
-// @updateLog 0.1.15 - 新增占比题（type=12）支持：此前该题型被兜底识别成填空题，填充词库文本导致提交被拦；现在按行的 issum 输入框精确识别、读出题目 total 作为合计目标、按权重分配并补齐取整误差后写入，同时同步滑块视觉位置，面板显示「占比题 / N 个占比项，合计 100」，题型筛选新增占比题。同时修复带封面页的问卷「多一步进入」：封面入口 #slideChunk 不是 a/button，此前不在可见按钮候选里，导致预览/自动化报「未识别到题目页或开始按钮」；现在优先识别并点击封面入口再等题目页出现。
+// @updateLog 0.1.18 - 修复身份证题与填空组（出生日期）填不上：① 身份证号的第 18 位是 GB 11643 加权校验码，此前生成器「前 17 位随机、末位随便写」，11 次里有 10 次会被问卷星的 checkIDCard 判「请输入正确的身份证号」，用户手填的号码也会被同样拒绝；现在按国标真算校验码，候选内容也改用完整校验（不再只判 18 位格式），实测生成的号码 500/500 通过问卷星自身的校验函数。② 填空题只派发 input/change，而问卷星在 input 上绑定的是 "keyup blur click"（verifyTxt + saveAnswer），导致界面有值但页面未校验、未存答案；现在补齐 focus/keyup/blur，让页面回调真正跑一遍。③ 填空组（type=9 / gapfill，如「出生日期：__年__月__日」）未被调用的根因是按题号 find 配置时不比对题型，升级后旧配置里的 unknown 条目抢先命中、走到 default 分支返回 false，页面即报「请回答此题」；现在同步时清理同题号的过时题型条目，并让查找同时匹配页面实际题型。
+// @updateLog 0.1.17 - 填空题按校验类型细分显示与提示：此前所有 text 题型在面板上一律标为「填空题」，号码题（verify='手机'）虽已正确填入 11 位号码、数字题虽已按数值填充，但用户无法从面板判断脚本会写什么；现在标签按 textRequirement 显示为「号码题 / 数字题 / 身份证题 / 邮箱题」，卡片副标题给出「按手机号格式填充」等说明，题型筛选新增这四个细分项。同时补上弹层选择类题目处理：问卷星的「多级下拉」（verify='多级下拉' + input[readonly] + onclick=openCityBox）校验的是弹层内部选中状态，直接写 value 只会留下页面不认的假值，提交时仍报未作答；现在扫描时标记 pickerBased，填写时跳过并在面板提示「需手动选择」，避免静默填错掩盖问题。
 // @updateLog 0.1.14 - 风控识别与自我保护：连续多次未通过人机验证时不再空撞，自动暂停并提示「疑似设备/IP 被风控、建议换网络」，避免把风控等级撞高；「设计份数」输入框下方新增份数建议提示，超过 100 份时用醒目样式提醒分批执行；「清除本地数据」按钮扩展为同时清理问卷星的作答残留（wjxanswerdata 等）与设备标识 Cookie（uuuvid / _c_WBKFRo / jac* / SERVERID），并在提示中给出换网络与冷却引导。
 // @updateLog 0.1.13 - 修复手机版（v.wjx.cn）矩阵题填不上：手机版矩阵数据行没有标题列，旧逻辑无条件跳过首列并依赖「行文本非空」判定数据行，导致 6 行全部被跳过、表头行反被当成数据行点击，提交时提示「请回答此题」；现在按 tr[rowindex] 精确取数据行、排除表头/分组行，并按是否存在标题列决定是否跳过首列。同时缓解快速档提交被拦：快速档压缩系数由 0.68 放宽到 0.85，并为快速档加上操作与提交前等待的绝对下限。
 // @updateLog 0.1.12 - 修复排序题（type=11）间歇性漏填：预览填写入口未复位上一轮自动化留下的停止标志，导致 fillSorting 按 isAutomationInterrupted 提前退出而静默跳过；现在预览入口会重置该标志，且排序题的逐项中断判断只在本题执行期间新出现的中断才收手。
@@ -104,8 +105,36 @@
         location: '地区题',
         sorting: '排序题',
         proportion: '占比题',
+        gapfill: '填空组',
         unknown: '未知题型'
     };
+
+    // 填空题按校验类型细分显示（号码题/数字题…都比笼统的「填空题」有用）。
+    // 题目 type 仍是 text，只有面板上的标签随 textRequirement 变化。
+    const TEXT_REQUIREMENT_LABELS = {
+        text: '普通文本',
+        number: '数字',
+        phone: '手机号',
+        idcard: '身份证号',
+        email: '邮箱'
+    };
+
+    const TEXT_REQUIREMENT_TAGS = {
+        number: '数字题',
+        phone: '号码题',
+        idcard: '身份证题',
+        email: '邮箱题'
+    };
+
+    function getQuestionTypeLabel(question) {
+        if (question && question.type === 'text') {
+            const tag = TEXT_REQUIREMENT_TAGS[question.textRequirement];
+            if (tag) {
+                return tag;
+            }
+        }
+        return TYPE_LABELS[question && question.type] || TYPE_LABELS.unknown;
+    }
 
     const State = {
         surveyKey: '',
@@ -374,6 +403,29 @@
             min-height: 88px;
             resize: vertical;
             line-height: 1.5;
+        }
+        .wjx-field-hint {
+            margin-top: -2px;
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--wjx-subtle);
+        }
+        .wjx-field-hint.is-warn {
+            color: #b45309;
+        }
+        .wjx-option-fill-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .wjx-option-fill-row > span {
+            font-size: 12px;
+            font-weight: 700;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .wjx-mode-switch {
             display: grid;
@@ -1032,9 +1084,14 @@
                             <option value="matrix">矩阵题</option>
                             <option value="slide">滑块题</option>
                             <option value="text">填空题</option>
+                            <option value="text-number">└ 数字题</option>
+                            <option value="text-phone">└ 号码题</option>
+                            <option value="text-idcard">└ 身份证题</option>
+                            <option value="text-email">└ 邮箱题</option>
                             <option value="location">地区题</option>
                             <option value="sorting">排序题</option>
                             <option value="proportion">占比题</option>
+                            <option value="gapfill">填空组</option>
                         </select>
                     </div>
                     <div id="wjx-question-list" class="wjx-list"></div>
@@ -1134,7 +1191,7 @@
                     updateCountModeHints();
                 }
             }
-            if (event.target.matches('[data-role="weight-input"], [data-role="content-editor"], [data-role="slide-min"], [data-role="slide-max"]')) {
+            if (event.target.matches('[data-role="weight-input"], [data-role="content-editor"], [data-role="slide-min"], [data-role="slide-max"], [data-role="option-fill"], [data-role="gap-value"]')) {
                 scheduleConfigSave();
             }
         });
@@ -1354,6 +1411,20 @@
 
             const next = Object.assign({}, question);
             next.enabled = previous.enabled !== false;
+            // 校验类型来自页面 DOM，不能写死沿用旧配置：问卷改题后 verify 可能变了。
+            next.textRequirement = question.textRequirement || previous.textRequirement || 'text';
+            // 弹层选择题（多级下拉）无法自动填写，标记出来供面板提示与自动化跳过。
+            next.pickerBased = question.pickerBased === true;
+            next.optionFills = mergeOptionFills(previous.optionFills, question.optionFills);
+            // 填空组：结构（格子数量/标签）以本次扫描为准，用户填的值仅在数量一致时沿用。
+            if (question.type === 'gapfill') {
+                const previousValues = Array.isArray(previous.gapValues) ? previous.gapValues : [];
+                const scannedCount = Array.isArray(question.gapValues) ? question.gapValues.length : 0;
+                next.gapValues = Array.from({ length: scannedCount }, (value, index) => {
+                    const kept = String(previousValues[index] == null ? '' : previousValues[index]).trim();
+                    return kept || question.gapValues[index];
+                });
+            }
             if (question.type === 'text') {
                 next.content = Array.isArray(previous.content) && previous.content.length ? previous.content.slice() : question.content.slice();
             } else if (question.type === 'slide') {
@@ -1381,6 +1452,30 @@
                 : 'normal',
             questions: mergedQuestions
         };
+    }
+
+    // 合并「选项内嵌填空」配置：以本次页面扫描出的结构为准（哪些选项带输入框是 DOM 事实），
+    // 只在结构一致时沿用用户上次填的值，避免问卷换题后把旧值写到错误选项上。
+    function mergeOptionFills(previousFills, scannedFills) {
+        const base = Array.isArray(scannedFills) ? scannedFills.map((item) => Object.assign({}, item)) : [];
+        if (!Array.isArray(previousFills) || !previousFills.length) {
+            return base;
+        }
+        return base.map((scanned, index) => {
+            const previous = previousFills[index];
+            if (!previous || typeof previous !== 'object') {
+                return scanned;
+            }
+            // 上一次该位置没有内嵌框、这次有（或反之），结构已变，用扫描结果。
+            if (!scanned || !scanned.enabled !== !previous.enabled) {
+                return scanned;
+            }
+            const value = String(previous.value == null ? '' : previous.value).trim();
+            if (!value) {
+                return scanned;
+            }
+            return { enabled: scanned.enabled, value };
+        });
     }
 
     function findMatchingQuestion(list, question) {
@@ -1453,6 +1548,15 @@
         if (Array.isArray(next.relations)) {
             next.relations = next.relations.map((relation) => Object.assign({}, relation));
         }
+        if (Array.isArray(next.optionFills)) {
+            next.optionFills = next.optionFills.map((fill) => Object.assign({}, fill));
+        }
+        if (Array.isArray(next.gapLabels)) {
+            next.gapLabels = next.gapLabels.slice();
+        }
+        if (Array.isArray(next.gapValues)) {
+            next.gapValues = next.gapValues.slice();
+        }
         return next;
     }
 
@@ -1517,6 +1621,21 @@
             minScore: clampScore(question.minScore, 1),
             maxScore: clampScore(question.maxScore, 100),
             proportionTotal: Math.max(1, Number(question.proportionTotal) || 100),
+            textRequirement: ['text', 'number', 'phone', 'idcard', 'email'].includes(question.textRequirement)
+                ? question.textRequirement
+                : 'text',
+            optionFills: Array.isArray(question.optionFills)
+                ? question.optionFills.slice(0, 100).map((fill) => ({
+                    enabled: !!(fill && fill.enabled),
+                    value: String(fill && fill.value != null ? fill.value : '').trim().slice(0, 200)
+                }))
+                : [],
+            gapLabels: Array.isArray(question.gapLabels)
+                ? question.gapLabels.slice(0, 50).map((label) => String(label == null ? '' : label).trim().slice(0, 20))
+                : [],
+            gapValues: Array.isArray(question.gapValues)
+                ? question.gapValues.slice(0, 50).map((value) => String(value == null ? '' : value).trim().slice(0, 200))
+                : [],
             relations: Array.isArray(question.relations)
                 ? question.relations.slice(0, 100).map((relation) => ({
                     topicId: String(relation && relation.topicId || ''),
@@ -1709,6 +1828,19 @@
 
     function findConfigQuestionByTopicId(topicId) {
         return State.config.questions.find((item) => String(item.id) === String(topicId)) || null;
+    }
+
+    // 按题号 + 页面实际题型取配置。
+    // 旧配置里可能残留同题号的过时题型（脚本升级后题型识别变化），
+    // 只按题号 find 会取到那一条，导致填错分支。
+    function findConfigQuestionForNode(questionId, node) {
+        const expectedType = node ? detectType(node) : '';
+        return State.config.questions.find((item) => {
+            if (String(item.id) !== String(questionId)) {
+                return false;
+            }
+            return !expectedType || item.type === expectedType;
+        }) || null;
     }
 
     function getRelationOptionCount(relation) {
@@ -2182,7 +2314,7 @@
 
     function renderQuestionCard(question) {
         const title = escapeHtml(question.title || `题目 ${question.order}`);
-        const typeLabel = TYPE_LABELS[question.type] || TYPE_LABELS.unknown;
+        const typeLabel = getQuestionTypeLabel(question);
         const meta = escapeHtml(buildQuestionMeta(question));
         const enabled = question.enabled !== false;
         const weights = Array.isArray(question.weights) ? question.weights : [];
@@ -2192,6 +2324,10 @@
                 <div class="wjx-field">
                     <label>候选内容</label>
                     <textarea class="wjx-textarea" data-role="content-editor" placeholder="每行一个候选内容">${escapeHtml(Array.isArray(question.content) ? question.content.join('\n') : '')}</textarea>
+                    ${question.pickerBased
+                        ? '<div class="wjx-field-hint is-warn">本题是弹层选择类（如多级下拉），脚本无法自动选择，需要手动点开弹层选择。自动提交前请确认已选择。</div>'
+                        : ''}
+                    ${formatRequirementHint(question.textRequirement) ? `<div class="wjx-field-hint${question.textRequirement === 'text' ? '' : ' is-warn'}">${escapeHtml(formatRequirementHint(question.textRequirement))}</div>` : ''}
                 </div>
             `
             : question.type === 'slide'
@@ -2209,6 +2345,20 @@
                 `
             : question.type === 'unknown'
                 ? ''
+            : question.type === 'gapfill'
+                ? `
+                    <div class="wjx-field">
+                        <label>各组填空内容</label>
+                        ${Array.isArray(question.gapLabels) && question.gapLabels.length
+                            ? question.gapLabels.map((label, index) => `
+                                <div class="wjx-option-fill-row">
+                                    <span title="${escapeHtml(label)}">${escapeHtml(label || `第${index + 1}项`)}</span>
+                                    <input type="text" class="wjx-input" value="${escapeHtml(String((question.gapValues || [])[index] || ''))}" data-role="gap-value" data-index="${index}" placeholder="填入该格内容" />
+                                </div>
+                            `).join('')
+                            : '<div class="wjx-field-hint is-warn">未识别到填空格，请点「重新扫描」。</div>'}
+                    </div>
+                `
             : question.type === 'location' || question.type === 'sorting'
                 ? `
                     <div class="wjx-empty" style="padding:16px 8px;">已适配自动随机选取并排序，不使用比例/次数配置。</div>
@@ -2224,10 +2374,30 @@
                         `).join('')}
                     </div>
                 `;
+        // 复合题：列出所有带内嵌填空的选项，让用户指定选中该项后填什么内容。
+        const optionFillRows = Array.isArray(question.optionFills)
+            ? question.optionFills.map((fill, index) => ({ fill, index })).filter((item) => item.fill && item.fill.enabled !== false)
+            : [];
+        const optionFillEditor = optionFillRows.length
+            ? `
+                <div class="wjx-field">
+                    <label>选项内嵌填空内容</label>
+                    <div class="wjx-field-hint">以下选项选中后需要填写内容，留空则不填（可能被判为未作答）。</div>
+                    ${optionFillRows.map(({ fill, index }) => `
+                        <div class="wjx-option-fill-row">
+                            <span title="${escapeHtml(question.optionLabels[index] || `选项${index + 1}`)}">${escapeHtml(question.optionLabels[index] || `选项${index + 1}`)}</span>
+                            <input type="text" class="wjx-input" value="${escapeHtml(fill.value || '')}" data-role="option-fill" data-index="${index}" placeholder="填入该选项的补充内容" />
+                        </div>
+                    `).join('')}
+                </div>
+            `
+            : '';
         const presetTool = question.type === 'text'
             ? '<button type="button" class="wjx-chip" data-preset="text-default">填入默认词库</button>'
             : question.type === 'slide'
                 ? '<button type="button" class="wjx-chip" data-preset="slide-default">随机分值区间</button>'
+            : question.type === 'gapfill'
+                ? '<button type="button" class="wjx-chip" data-preset="gap-random">随机各组内容</button>'
             : question.type === 'unknown' || question.type === 'location' || question.type === 'sorting'
                     ? ''
                     : `<button type="button" class="wjx-chip" data-preset="random">${question.type === 'proportion' ? '随机比例' : getRandomPresetLabel()}</button>`;
@@ -2247,18 +2417,19 @@
             ? Math.max(1, Number(question.proportionTotal) || 100)
             : Math.round(weightTotal);
         const summarySuffix = question.type === 'proportion' ? '' : (isCountMode() ? ' 次' : '');
-        const summary = question.type !== 'text' && question.type !== 'slide' && question.type !== 'unknown' && question.type !== 'location' && question.type !== 'sorting'
+        const summary = question.type !== 'text' && question.type !== 'slide' && question.type !== 'unknown' && question.type !== 'location' && question.type !== 'sorting' && question.type !== 'gapfill'
             ? `<div class="wjx-weight-summary" data-role="weight-summary">合计 ${summaryTotal}${summarySuffix}</div>`
             : '';
 
         return `
-            <article class="wjx-card${enabled ? '' : ' is-disabled'}" data-qid="${escapeHtml(String(question.id))}" data-type="${escapeHtml(question.type)}">
+            <article class="wjx-card${enabled ? '' : ' is-disabled'}" data-qid="${escapeHtml(String(question.id))}" data-type="${escapeHtml(question.type)}" data-requirement="${escapeHtml(question.type === 'text' ? (question.textRequirement || 'text') : '')}">
                 <div class="wjx-card-head">
                     <div class="wjx-card-title">Q${question.order}. ${title}</div>
                     <div class="wjx-card-type">${typeLabel}</div>
                 </div>
                 <div class="wjx-card-meta">${meta}</div>
                 ${editor}
+                ${optionFillEditor}
                 ${summary}
                 ${countHint}
                 ${tools}
@@ -2270,7 +2441,16 @@
         const search = cleanText(document.getElementById('wjx-question-search') && document.getElementById('wjx-question-search').value).toLowerCase();
         const type = String(document.getElementById('wjx-question-type-filter') && document.getElementById('wjx-question-type-filter').value || 'all');
         document.querySelectorAll(`#${PANEL_ID} .wjx-card`).forEach((card) => {
-            const matchesType = type === 'all' || card.dataset.type === type;
+            let matchesType;
+            if (type === 'all') {
+                matchesType = true;
+            } else if (type.startsWith('text-')) {
+                // 填空题细分筛选项：text-phone / text-number / text-idcard / text-email
+                matchesType = card.dataset.type === 'text' &&
+                    card.dataset.requirement === type.slice('text-'.length);
+            } else {
+                matchesType = card.dataset.type === type;
+            }
             const matchesSearch = !search || cleanText(card.textContent).toLowerCase().includes(search);
             card.classList.toggle('is-filtered', !matchesType || !matchesSearch);
         });
@@ -2324,6 +2504,12 @@
                 }
                 if (Array.isArray(question.weights) && Array.isArray(target.weights) && question.weights.length === target.weights.length) {
                     target.weights = question.weights.slice();
+                }
+                // 选项内嵌填空只在两边结构一致时复制，避免把「mL」的值搬到「两」的选项上。
+                if (Array.isArray(question.optionFills) && Array.isArray(target.optionFills) &&
+                    question.optionFills.length === target.optionFills.length &&
+                    question.optionLabels.length === target.optionLabels.length) {
+                    target.optionFills = question.optionFills.map((fill) => Object.assign({}, fill));
                 }
                 if (question.type === 'text') {
                     target.content = Array.isArray(question.content) ? question.content.slice() : [];
@@ -2423,7 +2609,9 @@
             return `${question.rowCount || 0} 行 ${question.optionLabels.length} 列`;
         }
         if (question.type === 'text') {
-            return '填空题';
+            const requirement = question.textRequirement || 'text';
+            const tag = TEXT_REQUIREMENT_TAGS[requirement];
+            return tag ? `${tag}（按${TEXT_REQUIREMENT_LABELS[requirement]}格式填充）` : '填空题';
         }
         if (question.type === 'slide') {
             return `分值范围 ${clampScore(question.minScore, 1)} - ${clampScore(question.maxScore, 100)}`;
@@ -2475,8 +2663,38 @@
                 proportionTotal: Math.max(1, Number(original.proportionTotal) || 100),
                 enabled: original.enabled !== false,
                 minScore: clampScore(original.minScore, 1),
-                maxScore: clampScore(original.maxScore, 100)
+                maxScore: clampScore(original.maxScore, 100),
+                textRequirement: original.textRequirement || 'text',
+                pickerBased: original.pickerBased === true,
+                gapLabels: Array.isArray(original.gapLabels) ? original.gapLabels.slice() : [],
+                gapValues: Array.isArray(original.gapValues) ? original.gapValues.slice() : [],
+                optionFills: Array.isArray(original.optionFills)
+                    ? original.optionFills.map((fill) => Object.assign({ enabled: false, value: '' }, fill))
+                    : []
             };
+
+            // 选项内嵌填空：以面板当前输入框的值为准（用户可能刚改过）。
+            const fillInputs = Array.from(card.querySelectorAll('[data-role="option-fill"]'));
+            if (fillInputs.length && next.optionFills.length) {
+                fillInputs.forEach((input) => {
+                    const index = Number(input.dataset.index);
+                    if (!Number.isInteger(index) || index < 0 || index >= next.optionFills.length) {
+                        return;
+                    }
+                    next.optionFills[index] = Object.assign({}, next.optionFills[index], {
+                        enabled: true,
+                        value: String(input.value || '').trim()
+                    });
+                });
+            }
+
+            // 填空组（gapfill）：各格内容同样以面板为准。
+            const gapInputs = Array.from(card.querySelectorAll('[data-role="gap-value"]'));
+            if (gapInputs.length) {
+                next.gapValues = gapInputs
+                    .sort((left, right) => Number(left.dataset.index) - Number(right.dataset.index))
+                    .map((input) => String(input.value || '').trim());
+            }
 
             if (type === 'text') {
                 const area = card.querySelector('[data-role="content-editor"]');
@@ -2489,7 +2707,7 @@
                 if (next.maxScore < next.minScore) {
                     next.maxScore = next.minScore;
                 }
-            } else if (type !== 'unknown') {
+            } else if (type !== 'unknown' && type !== 'gapfill') {
                 next.weights = Array.from(card.querySelectorAll('[data-role="weight-input"]')).map((input) => {
                     const value = Number(input.value);
                     return Number.isFinite(value) && value >= 0 ? value : 0;
@@ -2522,6 +2740,20 @@
                 maxInput.value = String(maxScore);
                 showToast('已生成随机分值区间。');
             }
+            return;
+        }
+        // 填空组：按各格含义重新随机（年/月/日各自合法范围）。
+        if (preset === 'gap-random') {
+            const gapInputs = Array.from(card.querySelectorAll('[data-role="gap-value"]'));
+            const question = findQuestionByCard(card) || {};
+            gapInputs.forEach((input) => {
+                const index = Number(input.dataset.index);
+                const label = Array.isArray(question.gapLabels) ? question.gapLabels[index] : '';
+                input.value = suggestGapfillValue(label);
+            });
+            syncStateFromDom();
+            scheduleConfigSave();
+            showToast('已随机各组填空内容。');
             return;
         }
 
@@ -2591,9 +2823,25 @@
                 }
                 return;
             }
+            if (type === 'gapfill') {
+                // 填空组按各格含义重新随机（年/月/日各自合法范围），避免多份提交值完全相同。
+                const gapQuestion = findQuestionByCard(card) || {};
+                card.querySelectorAll('[data-role="gap-value"]').forEach((input) => {
+                    const index = Number(input.dataset.index);
+                    input.value = suggestGapfillValue(Array.isArray(gapQuestion.gapLabels) ? gapQuestion.gapLabels[index] : '');
+                });
+                return;
+            }
             if (type === 'unknown' || type === 'location' || type === 'sorting') {
                 return;
             }
+            // 复合题的内嵌填空值一并随机，避免多份提交里永远是同一个数字。
+            card.querySelectorAll('[data-role="option-fill"]').forEach((input) => {
+                const labels = (findQuestionByCard(card) || {}).optionLabels;
+                const index = Number(input.dataset.index);
+                const optionLabel = Array.isArray(labels) && Number.isInteger(index) ? String(labels[index] || '') : '';
+                input.value = suggestInlineValueByLabel(optionLabel);
+            });
             const original = findQuestionByCard(card) || { relations: [] };
             const values = buildRandomWeightValues(getQuestionWeightInputCount(card, original), original);            card.querySelectorAll('[data-role="weight-input"]').forEach((input, index) => {
                 input.value = String(values[index] || 0);
@@ -2775,11 +3023,23 @@
             maxSelections: 0,
             enabled: true,
             minScore: 1,
-            maxScore: 100
+            maxScore: 100,
+            // 选项内嵌填空（复合题）与填空题的校验类型，非对应题型时保持空值。
+            optionFills: [],
+            optionTexts: {},
+            textRequirement: 'text'
         };
 
         if (type === 'text') {
-            return Object.assign(base, { content: DEFAULT_TEXT_LIBRARY.slice() });
+            const textInput = node.querySelector('textarea, input[type="text"], input[type="tel"], input[type="email"], input[type="number"]');
+            return Object.assign(base, {
+                content: DEFAULT_TEXT_LIBRARY.slice(),
+                // 问卷星用 verify 属性表达校验规则（数字/手机/身份证号…）。
+                // 填内容时必须以它为准，否则「数字」题会被写成手机号。
+                textRequirement: detectTextRequirement(node),
+                // 弹层选择题（多级下拉）无法写值，标记后由面板提示、自动化跳过。
+                pickerBased: isPickerBasedInput(textInput)
+            });
         }
 
         if (type === 'slide') {
@@ -2791,6 +3051,17 @@
 
         if (type === 'unknown') {
             return base;
+        }
+
+        // 填空组（type=9 / gapfill）：多个 contenteditable 空格，每个空格对应一个隐藏 input。
+        // 面板按空格数量渲染可编辑单元，用户可为「年/月/日」分别指定内容。
+        if (type === 'gapfill') {
+            const slots = extractGapfillSlots(node);
+            return Object.assign(base, {
+                gapLabels: slots.map((slot) => slot.label),
+                gapValues: slots.map((slot) => slot.suggested),
+                rowCount: slots.length
+            });
         }
 
         // 地区题、排序题：填写逻辑为随机选择，不读 weights。
@@ -2814,13 +3085,68 @@
 
         const detail = extractDetail(node, type);
         const limits = extractSelectionLimits(node, type, detail.optionLabels.length);
-        return Object.assign(base, {
+        const config = Object.assign(base, {
             optionLabels: detail.optionLabels,
             rowCount: detail.rowCount || 0,
             minSelections: limits.minSelections,
             maxSelections: limits.maxSelections,
             weights: Array.from({ length: detail.optionLabels.length }, () => 1)
         });
+        // 复合题：选项里带「（请填写）…」内嵌输入框时，为每个这样的选项生成一条可配置项，
+        // 这样用户能指定选中该项后往框里填什么，而不是由脚本写死「其他」。
+        if (type === 'radio' || type === 'checkbox' || type === 'dropdown') {
+            config.optionFills = extractOptionFills(node, type, detail.optionLabels.length);
+        }
+        return config;
+    }
+
+    // 提取「选项内嵌填空」的默认配置。没有内嵌框的选项给 enabled:false + 空值，
+    // 面板据此渲染可编辑输入框；value 留给用户填写，脚本只负责把值写进对应输入框。
+    function extractOptionFills(node, type, optionCount) {
+        const options = getChoiceElements(node, type);
+        const fills = [];
+        for (let index = 0; index < optionCount; index++) {
+            const option = options[index];
+            if (!option || !optionHasInlineInput(option)) {
+                fills.push({ enabled: false, value: '' });
+                continue;
+            }
+            fills.push({
+                enabled: true,
+                value: readInlineOptionInput(option) || suggestInlineOptionValue(option)
+            });
+        }
+        return fills;
+    }
+
+    // 内嵌填空的默认值建议：按选项标签里的单位判断量级。
+    // 标签形如「（请填写）两」「（请填写）mL」，末尾还带必填星号，先剥掉再判断。
+    function suggestInlineOptionValue(option) {
+        const label = cleanText(option.querySelector('.label') ? option.querySelector('.label').textContent : '');
+        return suggestInlineValueByLabel(label);
+    }
+
+    // 按单位推断合理的数值量级。抽出独立函数，供扫描默认值与「随机」按钮共用，
+    // 避免两处规则漂移（曾出现扫描给 1~5 两、随机按钮给 100~500 两的不一致）。
+    function suggestInlineValueByLabel(rawLabel) {
+        const unit = String(rawLabel || '').replace(/[*＊\s]/g, '');
+        if (/岁|年龄/.test(unit)) {
+            return String(randomInt(20, 60));
+        }
+        // 「两」是中国市制，一两约 50mL，按 1~5 两给值才不会出现「500 两」这种离谱答案。
+        if (/两$|两[)）]$/.test(unit)) {
+            return String(randomInt(1, 5));
+        }
+        if (/mL|毫升/i.test(unit)) {
+            return String(randomInt(100, 500));
+        }
+        if (/克|kg|公斤|斤/i.test(unit)) {
+            return String(randomInt(100, 500));
+        }
+        if (/度/.test(unit)) {
+            return String(randomInt(30, 60));
+        }
+        return String(randomInt(1, 10));
     }
 
     function extractQuestionId(node, fallbackOrder) {
@@ -2867,6 +3193,15 @@
         if (wjxType === '12') {
             return 'proportion';
         }
+        // 填空型（填空组）：type=9 且带 gapfill 属性，输入是 contenteditable 的
+        // span.textCont，旁边的 input 只是隐藏的取值载体（如「出生日期：__年__月__日」）。
+        // 必须排在其他分支前面：它内部既没有 radio 也没有可见 input，
+        // 否则会被兜底成 unknown。
+        if (wjxType === '9' || node.getAttribute('gapfill') === '1') {
+            if (node.querySelector('.textEdit .textCont[contenteditable], .textCont[contenteditable]')) {
+                return 'gapfill';
+            }
+        }
         if (node.getAttribute('total') && node.querySelector('input[issum="1"], table.matrix-rating')) {
             return 'proportion';
         }
@@ -2899,6 +3234,193 @@
             return 'text';
         }
         return 'unknown';
+    }
+
+    // ===== 校验类型（verify）识别 =====
+    // 问卷星把输入校验写在 input 的 verify 属性上（数字/手机/身份证号/多级下拉…），
+    // 单看 <input type> 无法区分「度数」和「手机号」——两者的 type 都是 tel。
+    // 因此一切「该填什么内容」的判定都必须先看 verify。
+    // 标签定义在文件上方（与 TYPE_LABELS 同处），此处仅保留识别逻辑。
+
+    function detectTextRequirement(scope) {
+        if (!scope) {
+            return 'text';
+        }
+        const input = scope.matches && scope.matches('input, textarea')
+            ? scope
+            : scope.querySelector('input[type="tel"], input[type="text"], input[type="number"], input[type="email"], textarea');
+        const holder = (scope.closest && scope.closest('.field, .div_question, .ui-field-contain')) || scope;
+
+        const verify = String(
+            (input && input.getAttribute('verify')) ||
+            (holder && holder.getAttribute && holder.getAttribute('verify')) ||
+            ''
+        ).trim();
+        if (verify) {
+            if (/身份证/.test(verify)) {
+                return 'idcard';
+            }
+            if (/手机|电话/.test(verify)) {
+                return 'phone';
+            }
+            if (/邮件|邮箱|email/i.test(verify)) {
+                return 'email';
+            }
+            if (/数字|整数|数值/.test(verify)) {
+                return 'number';
+            }
+            // 多级下拉等脚本暂不支持的校验：退回文本，至少不产出格式错误的号码
+            return 'text';
+        }
+
+        const type = input ? (input.getAttribute('type') || '').toLowerCase() : '';
+        if (type === 'email') {
+            return 'email';
+        }
+        if (type === 'number') {
+            return 'number';
+        }
+        // tel 没有 verify 时才当手机号；有 verify='数字' 的已在上方判为 number。
+        if (type === 'tel') {
+            return 'phone';
+        }
+        return 'text';
+    }
+
+    function formatRequirementHint(requirement) {
+        const label = TEXT_REQUIREMENT_LABELS[requirement] || TEXT_REQUIREMENT_LABELS.text;
+        if (requirement === 'text') {
+            return '';
+        }
+        return `本题校验为「${label}」：候选内容会先按该格式过滤，不含数字的候选会被自动剔除；全部不可用时按格式自动生成。`;
+    }
+
+    // 候选内容是否满足校验格式：避免把「11/12/13」这类词库写进手机号题，或把中文写进数字题。
+    function isContentAllowedForRequirement(value, requirement) {
+        const text = String(value == null ? '' : value).trim();
+        if (!text) {
+            return false;
+        }
+        if (requirement === 'number') {
+            return /^-?\d+(\.\d+)?$/.test(text);
+        }
+        if (requirement === 'phone') {
+            return /^1[3-9]\d{9}$/.test(text);
+        }
+        if (requirement === 'idcard') {
+            // 只判格式不够：末位校验码错了，问卷星照样判「请输入正确的身份证号」。
+            return isValidIdCard(text);
+        }
+        if (requirement === 'email') {
+            return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
+        }
+        return true;
+    }
+
+    // 身份证号第 18 位是 GB 11643 的加权校验码，由前 17 位算出。
+    // 问卷星提交时会走 checkIDCard 做同样的校验，所以「前 17 位随机、末位随便写」
+    // 生成的号码 11 次里有 10 次会被判「请输入正确的身份证号」——必须真算。
+    const ID_CARD_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
+    const ID_CARD_CHECK_CODES = ['1', '0', 'X', '9', '8', '7', '6', '5', '4', '3', '2'];
+
+    function computeIdCardChecksum(prefix17) {
+        const digits = String(prefix17 || '');
+        if (!/^\d{17}$/.test(digits)) {
+            return '';
+        }
+        let sum = 0;
+        for (let i = 0; i < 17; i++) {
+            sum += Number(digits[i]) * ID_CARD_WEIGHTS[i];
+        }
+        return ID_CARD_CHECK_CODES[sum % 11];
+    }
+
+    function isValidIdCard(value) {
+        const text = String(value == null ? '' : value).trim();
+        if (!/^\d{17}[\dXx]$/.test(text)) {
+            return false;
+        }
+        return computeIdCardChecksum(text.slice(0, 17)) === text[17].toUpperCase();
+    }
+
+    function generateValueForRequirement(requirement, input) {
+        if (requirement === 'number') {
+            const max = Number(input && input.max) > 0 ? Math.min(Number(input.max), 99999) : 99999;
+            const min = Number.isFinite(Number(input && input.min)) ? Math.max(0, Number(input.min)) : 0;
+            return String(randomInt(min, Math.max(min, max)));
+        }
+        if (requirement === 'phone') {
+            // 11 位手机号，1 开头，第二位取 3-9 避免旧号段
+            return '1' + randomInt(3, 9) + String(randomInt(100000000, 999999999));
+        }
+        if (requirement === 'idcard') {
+            // 年份取 1975-2003：问卷星年份正则是 ([1][9][0-9]{2}|[2][0][0|1|2|3][0-9])，
+            // 即 19xx 与 2000-2039，2040 起会被判非法。
+            // 日限制 1-28，避开 2 月 30 日这类页面正则不校验的非法日期。
+            const prefix = '110101' + String(randomInt(1975, 2003)) +
+                String(randomInt(1, 12)).padStart(2, '0') + String(randomInt(1, 28)).padStart(2, '0') +
+                String(randomInt(100, 999));
+            return prefix + computeIdCardChecksum(prefix);
+        }
+        if (requirement === 'email') {
+            const user = 'u' + randomInt(1000, 9999);
+            const domains = ['qq.com', '163.com', '126.com', 'sina.com', 'outlook.com', 'gmail.com'];
+            return `${user}@${domains[randomInt(0, domains.length - 1)]}`;
+        }
+        return '';
+    }
+
+    // 提取填空组（gapfill）的每个空格：返回 [{ label, suggested }]。
+    // 结构是 <label class="textEdit"><span class="textCont" contenteditable></span></label>年
+    // 空格本身没有名字，名字是它紧后面的文本节点（「年」「月」「日」）。
+    function extractGapfillSlots(node) {
+        const spans = Array.from(node.querySelectorAll('.textEdit .textCont[contenteditable], .textCont[contenteditable]'));
+        return spans.map((span, index) => {
+            const label = readGapfillSlotLabel(span, index);
+            return { label, suggested: suggestGapfillValue(label, index) };
+        });
+    }
+
+    // 空格的标签来自 label 之后的兄弟文本（「年」「月」「日」），
+    // 取不到时退化为「第N项」。日期题的三个空格按位置兜底为 年/月/日。
+    function readGapfillSlotLabel(span, index) {
+        const labelEl = span.closest && span.closest('.textEdit');
+        if (labelEl && labelEl.nextSibling) {
+            let text = '';
+            let cursor = labelEl.nextSibling;
+            // 单位文本可能被空白/换行拆成多个节点，拼到下一个元素为止
+            while (cursor && cursor.nodeType === 3 && text.length < 8) {
+                text += cursor.nodeValue || '';
+                cursor = cursor.nextSibling;
+            }
+            const cleaned = cleanText(text).replace(/[:：,，。]/g, '');
+            if (cleaned) {
+                return cleaned.slice(0, 6);
+            }
+        }
+        return ['年', '月', '日'][index] || `第${index + 1}项`;
+    }
+
+    // 按空格含义给出默认值。日期题（年/月/日）用合法范围随机；
+    // 「999」在问卷星里是「不清楚」的约定值，不要默认用它。
+    function suggestGapfillValue(label) {
+        const text = String(label || '');
+        if (/年/.test(text)) {
+            return String(randomInt(1955, 2005));
+        }
+        if (/月/.test(text)) {
+            return String(randomInt(1, 12));
+        }
+        if (/日|天/.test(text)) {
+            return String(randomInt(1, 28));
+        }
+        if (/时|点/.test(text)) {
+            return String(randomInt(0, 23));
+        }
+        if (/分/.test(text)) {
+            return String(randomInt(0, 59));
+        }
+        return String(randomInt(1, 10));
     }
 
     function extractSelectionLimits(node, type, optionCount) {
@@ -3080,7 +3602,12 @@
     }
 
     function trimOptionPrefix(text) {
-        return String(text || '').replace(/^[A-ZＡ-Ｚa-zａ-ｚ0-9０-９]+[\.\、\)]\s*/, '').trim();
+        return String(text || '')
+            .replace(/^[A-ZＡ-Ｚa-zａ-ｚ0-9０-９]+[\.\、\)]\s*/, '')
+            // 选项内嵌填空的必填框会在标签末尾多出一个星号（「（请填写）mL*」），
+            // 它不是选项文本的一部分，留着会让面板显示和同类题匹配都变脏。
+            .replace(/\s*[*＊]+\s*$/, '')
+            .trim();
     }
 
     function cleanText(text) {
@@ -3602,9 +4129,30 @@
             return;
         }
         const existingQuestions = Array.isArray(State.config.questions) ? State.config.questions : [];
-        const mergedQuestions = existingQuestions.slice();
+        let mergedQuestions = existingQuestions.slice();
         const newQuestionKeys = new Set();
         let changed = false;
+
+        // 清掉「同题号但题型已变」的历史条目。
+        // 升级脚本后题型识别会变（例如 Q5 早期被判 unknown，现在识别为 gapfill），
+        // 旧条目仍留在配置里；而填写循环按题号 find 第一条，会命中旧的 unknown 条目，
+        // 走到 default 分支直接返回 false，页面上就显示「请回答此题」。
+        const scannedIdToType = new Map();
+        scannedQuestions.forEach((question) => {
+            const key = String(question.id);
+            // 同题号出现多个题型时保留扫描到的第一个（与 findQuestionNodes 顺序一致）
+            if (!scannedIdToType.has(key)) {
+                scannedIdToType.set(key, question.type);
+            }
+        });
+        const beforePrune = mergedQuestions.length;
+        mergedQuestions = mergedQuestions.filter((item) => {
+            const expectedType = scannedIdToType.get(String(item.id));
+            return expectedType === undefined || expectedType === item.type;
+        });
+        if (mergedQuestions.length !== beforePrune) {
+            changed = true;
+        }
 
         scannedQuestions.forEach((question) => {
             const index = mergedQuestions.findIndex((item) => String(item.id) === String(question.id) && item.type === question.type);
@@ -3652,6 +4200,17 @@
             return next;
         }
         next.enabled = previous.enabled !== false;
+        // 结构类字段（哪些选项带内嵌框）以本次扫描为准，用户填的值在不改变结构时保留。
+        next.optionFills = mergeOptionFills(previous.optionFills, question.optionFills);
+        // 填空组：格子数量/标签以扫描为准，用户填的值按格沿用。
+        if (question.type === 'gapfill') {
+            const previousValues = Array.isArray(previous.gapValues) ? previous.gapValues : [];
+            const scannedCount = Array.isArray(question.gapValues) ? question.gapValues.length : 0;
+            next.gapValues = Array.from({ length: scannedCount }, (value, index) => {
+                const kept = String(previousValues[index] == null ? '' : previousValues[index]).trim();
+                return kept || question.gapValues[index];
+            });
+        }
         if (question.type === 'text') {
             next.content = Array.isArray(previous.content) && previous.content.length ? previous.content.slice() : question.content.slice();
         } else if (question.type === 'slide') {
@@ -3699,7 +4258,7 @@
                     if (relations.length && !isRelationSatisfied(relations)) {
                         continue;
                     }
-                    const question = State.config.questions.find((item) => String(item.id) === String(questionId));
+                    const question = findConfigQuestionForNode(questionId, node);
                     if (!question || question.enabled === false) {
                         continue;
                     }
@@ -3724,7 +4283,7 @@
                         return false;
                     }
                     const relations = parseRelations(node);
-                    const question = State.config.questions.find((item) => String(item.id) === String(questionId));
+                    const question = findConfigQuestionForNode(questionId, node);
                     if (!question || question.enabled === false) {
                         return false;
                     }
@@ -3792,7 +4351,7 @@
             case 'dropdown':
             case 'rating': {
                 const index = pickOptionIndexForQuestion(question);
-                const selected = clickOption(node, index, question.type);
+                const selected = clickOption(node, index, question.type, question);
                 if (isCountMode() && selected) {
                     consumeFlatQuota(question.id, index);
                 }
@@ -3801,7 +4360,7 @@
             }
             case 'checkbox': {
                 const indices = pickCheckboxIndicesForQuestion(question);
-                const selectedIndices = indices.filter((idx) => clickOption(node, idx, question.type));
+                const selectedIndices = indices.filter((idx) => clickOption(node, idx, question.type, question));
                 if (isCountMode()) {
                     selectedIndices.forEach((idx) => consumeFlatQuota(question.id, idx));
                 }
@@ -3824,6 +4383,8 @@
                 return await fillSorting(node);
             case 'proportion':
                 return fillProportion(node, question);
+            case 'gapfill':
+                return fillGapfill(node, question);
             default:
                 return false;
         }
@@ -4557,7 +5118,7 @@
             option.querySelector('.jqchecked, .checked, .active, .rate-on, a.checked, a.jqchecked') !== null;
     }
 
-    function clickChoiceElement(option, type) {
+    function clickChoiceElement(option, type, optionFill) {
         if (!option) {
             return false;
         }
@@ -4588,16 +5149,66 @@
             }
         }
 
-        const otherInput = option.querySelector('input.OtherText, input.OtherRadioText, .OtherText, .OtherRadioText, .ui-text input[type="text"]');
-        if (otherInput && !otherInput.value) {
-            otherInput.value = '其他';
-            otherInput.dispatchEvent(new Event('input', { bubbles: true }));
-            otherInput.dispatchEvent(new Event('change', { bubbles: true }));
+        // 选项内嵌填空（问卷星的「（请填写）xx」复合题）：
+        // 结构是 .ui-radio > .ui-text(display:none) > input.OtherRadioText，
+        // 点击选项后由页面脚本把 .ui-text 显示出来，输入框才是可写状态。
+        // 旧逻辑写死 '其他' 且不看题目是否要求，等于把所有复合题都填成「其他」。
+        if (optionFill && optionFill.enabled !== false) {
+            fillInlineOptionInput(option, optionFill.value);
         }
         return isChoiceSelected(option, type);
     }
 
-    function clickOption(node, index, type) {
+    // 写入某个选项内嵌的填空框。value 为空时不做任何事（避免给非复合选项塞值）。
+    function fillInlineOptionInput(option, value) {
+        if (!option) {
+            return false;
+        }
+        const text = String(value == null ? '' : value).trim();
+        if (!text) {
+            return false;
+        }
+        const input = option.querySelector('input.OtherText, input.OtherRadioText, .OtherText, .OtherRadioText, .ui-text input[type="text"], .ui-text input[type="tel"]');
+        if (!input) {
+            return false;
+        }
+
+        // 先确保承载它的面板可见：点选项通常已触发显示，但 jQuery 动画/延时兜底一次。
+        const wrapper = input.closest('.ui-text') || input.parentElement;
+        if (wrapper && window.getComputedStyle(wrapper).display === 'none') {
+            wrapper.style.display = 'block';
+        }
+
+        input.value = text;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        // 部分问卷星版本给内嵌框绑了 blur 校验，补一次以获得「已作答」状态。
+        if (typeof input.blur === 'function') {
+            try {
+                input.dispatchEvent(new Event('blur', { bubbles: false }));
+            } catch (error) {}
+        }
+        return input.value === text;
+    }
+
+    // 读取某个选项内嵌填空的当前值。
+    function readInlineOptionInput(option) {
+        if (!option) {
+            return '';
+        }
+        const input = option.querySelector('input.OtherText, input.OtherRadioText, .OtherText, .OtherRadioText, .ui-text input[type="text"], .ui-text input[type="tel"]');
+        return input ? String(input.value || '').trim() : '';
+    }
+
+    // 选项是否带内嵌填空（复合题判定）。
+    function optionHasInlineInput(option) {
+        if (!option) {
+            return false;
+        }
+        return !!option.querySelector('input.OtherText, input.OtherRadioText, .OtherText, .OtherRadioText, .ui-text input[type="text"], .ui-text input[type="tel"]');
+    }
+
+    function clickOption(node, index, type, question) {
         if (type === 'dropdown') {
             const select = node.querySelector('select');
             if (select && select.options.length > index) {
@@ -4622,7 +5233,8 @@
             if (type === 'checkbox' && isChoiceSelected(option, type)) {
                 return true;
             }
-            let selected = clickChoiceElement(option, type);
+            const optionFill = getOptionFillConfig(question, index, option);
+            let selected = clickChoiceElement(option, type, optionFill);
             if (!isChoiceSelected(option, type)) {
                 const fallback = option.querySelector(type === 'checkbox' ? 'input[type="checkbox"]' : 'input[type="radio"]');
                 if (fallback && typeof fallback.click === 'function') {
@@ -4630,28 +5242,64 @@
                     selected = isChoiceSelected(option, type);
                 }
             }
+            // 若选项带内嵌填空但首次点击后输入框才显示，这里再补一次写入。
+            if (optionFill && optionFill.enabled !== false && !readInlineOptionInput(option)) {
+                fillInlineOptionInput(option, optionFill.value);
+            }
             return selected || isChoiceSelected(option, type);
         }
         return false;
     }
 
-    // 多输入填空题：按 input type 派发生成内容，避免电话/邮箱/数字框被写入普通词库文本导致校验失败。
-    // baseText 仍用于 textarea 和 input[type="text"]；其他 type 用各自格式覆盖。
+    // 取某个选项的「内嵌填空」配置。question.optionFills 与选项下标一一对应。
+    // 返回 null 表示该选项没有内嵌框（普通选项）；返回 {enabled:false} 表示有框但用户明确留空。
+    // 若用户在面板里没填值但选项确实带必填内嵌框，这里按单位生成一个合理值兜底——
+    // 否则该题会被问卷星判成「未作答」，整个批次卡在这里。
+    function getOptionFillConfig(question, optionIndex, optionElement) {
+        if (!optionElement || !optionHasInlineInput(optionElement)) {
+            return null;
+        }
+        const entry = question && Array.isArray(question.optionFills) ? question.optionFills[optionIndex] : null;
+        const value = String(entry && entry.value != null ? entry.value : '').trim();
+        if (value) {
+            return { enabled: true, value };
+        }
+        if (entry && entry.enabled === false) {
+            return { enabled: false, value: '' };
+        }
+        return { enabled: true, value: suggestInlineOptionValue(optionElement) };
+    }
+
+    // 多输入填空题：按「校验类型」派生内容，避免电话/邮箱/数字框被写入普通词库文本导致校验失败。
+    // 旧实现只看 input type，导致 verify='数字' 的度数题（type 是 tel）被写成 11 位手机号。
+    // 现在优先用 verify 判定，type 仅在没有 verify 时兜底。
+    // 弹层选择类输入框（如问卷星的「多级下拉」，input[readonly] + onclick=openCityBox）：
+    // 直接写 value 不生效——页面校验的是弹层内部的选中状态，硬写只会留下一个假值，
+    // 提交时仍报「未作答」。这类题必须走弹层交互，当前未适配，故显式跳过并提示。
+    function isPickerBasedInput(input) {
+        if (!input) {
+            return false;
+        }
+        const verify = String(input.getAttribute('verify') || '').trim();
+        if (/多级下拉|下拉选择/.test(verify)) {
+            return true;
+        }
+        // 只读且有弹层选择器的点击处理器（如 openCityBox），才是弹层选择题。
+        const isReadonly = input.hasAttribute('readonly') || input.readOnly === true;
+        const onclick = String(input.getAttribute('onclick') || '');
+        return isReadonly && /openCityBox|showPicker|openSelect|layer\.open|selectBox/i.test(onclick);
+    }
+
     function generateInputValue(input, baseText) {
-        const type = (input.getAttribute('type') || '').toLowerCase();
-        if (type === 'tel') {
-            // 11 位手机号，1 开头，第二位取 3-9 避免旧号段
-            return '1' + randomInt(3, 9) + String(randomInt(100000000, 999999999));
+        const requirement = detectTextRequirement(input);
+        // 候选项（用户配置的词库）优先：只要格式符合校验就直接使用，
+        // 这样「11 / 12 / 13」这类用户明确指定的度数才会真正被填进去。
+        if (baseText && isContentAllowedForRequirement(baseText, requirement)) {
+            return String(baseText).trim();
         }
-        if (type === 'email') {
-            const user = 'u' + randomInt(1000, 9999);
-            const domains = ['qq.com', '163.com', '126.com', 'sina.com', 'outlook.com', 'gmail.com'];
-            return `${user}@${domains[randomInt(0, domains.length - 1)]}`;
-        }
-        if (type === 'number') {
-            const max = Number(input.max) > 0 ? Math.min(Number(input.max), 99999) : 99999;
-            const min = Number.isFinite(Number(input.min)) ? Math.max(0, Number(input.min)) : 0;
-            return String(randomInt(min, Math.max(min, max)));
+        const generated = generateValueForRequirement(requirement, input);
+        if (generated) {
+            return generated;
         }
         return baseText;
     }
@@ -4662,25 +5310,48 @@
         if (!inputs.length) {
             return false;
         }
-        // 统计 text 类输入框（textarea + input[type=text]）的序号，
-        // 为它们从候选内容错开取值；tel/email/number 各自按类型生成。
-        let textIndex = 0;
-        inputs.forEach((input) => {
-            const type = (input.getAttribute('type') || '').toLowerCase();
-            const isTextArea = input.tagName === 'TEXTAREA';
-            const isText = isTextArea || type === 'text';
-            let value;
-            if (isText) {
-                value = pickRandomText(content, question, textIndex);
-                textIndex += 1;
-            } else {
-                value = generateInputValue(input, '');
+        // 弹层选择类输入框不写值：问卷星的「多级下拉」是 input[readonly] + onclick=openCityBox，
+        // 页面校验读的是弹层内部的选中状态，硬写 value 只会留下一个假值，
+        // 提交时照样报未作答，反而掩盖问题。这里跳过并由调用方按「未填写」处理。
+        const writable = inputs.filter((input) => !isPickerBasedInput(input));
+        if (!writable.length) {
+            if (inputs.length) {
+                logWarning('跳过弹层选择类填空题（如多级下拉），需手动选择', { count: inputs.length });
             }
-            input.value = value;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+            return false;
+        }
+
+        // 候选内容按校验类型预先过滤，过滤后为空则交给生成器（例如纯中文词库填到数字题）。
+        const requirement = (question && question.textRequirement) || detectTextRequirement(node);
+        const rawContent = Array.isArray(content) && content.length ? content : DEFAULT_TEXT_LIBRARY;
+        const filteredContent = rawContent.filter((value) => isContentAllowedForRequirement(value, requirement));
+        const usableContent = filteredContent.length ? filteredContent : rawContent;
+
+        // 每个输入框都先取一个候选内容，再按该框自己的校验规则决定用候选还是生成值。
+        // 这样 verify='数字' 的输入框会直接填用户配置的「11」，而不是凭空生成手机号。
+        let textIndex = 0;
+        writable.forEach((input) => {
+            const candidate = pickRandomText(usableContent, question, textIndex);
+            textIndex += 1;
+            const value = generateInputValue(input, candidate);
+            writeTextInput(input, value);
         });
         return true;
+    }
+
+    // 往填空题输入框写值。
+    // 问卷星在 input 上绑定的是 "keyup blur click"（见 jqmobo2.js：g.on("keyup blur click", ... → verifyTxt + saveAnswer)），
+    // 不收 input/change。只派发 input+change 的话：界面看着有值，但页面既没做校验、
+    // 也没把答案存进答案表，提交时仍报「请输入正确的身份证号」/「请回答此题」。
+    // 因此这里补齐 keyup 与 blur，让页面的校验与保存回调真正跑一遍。
+    function writeTextInput(input, value) {
+        input.focus({ preventScroll: true });
+        input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Unidentified' }));
+        input.dispatchEvent(new Event('blur', { bubbles: false }));
+        input.blur();
     }
 
     function fillSlide(node, minScore, maxScore) {
@@ -4718,6 +5389,87 @@
 
     // 占比题：所有行的数值必须恰好合计等于题目上的 total，否则问卷星校验不过。
     // 先按配置权重分配，再把取整误差补到最大项，并同步 rangeslider 的视觉位置。
+    // 填空组（gapfill，如「出生日期：__年__月__日」）填写。
+    // 问卷星的联动链路是：span.textCont 的 blur 回调把 textContent 写回它的前一个
+    // input.value，再 trigger 该 input 的 blur 触发 saveAnswer。
+    // 所以必须 ① 写 textContent（页面显示）② 触发 textCont 的 blur（同步到 input）。
+    // 直接写隐藏 input 的值不生效——用户看到空、提交也报未作答。
+    function fillGapfill(node, question) {
+        const spans = Array.from(node.querySelectorAll('.textEdit .textCont[contenteditable], .textCont[contenteditable]'));
+        if (!spans.length) {
+            return false;
+        }
+        const values = Array.isArray(question && question.gapValues) ? question.gapValues : [];
+        let filled = 0;
+
+        spans.forEach((span, index) => {
+            const raw = values[index] != null && String(values[index]).trim()
+                ? String(values[index]).trim()
+                : suggestGapfillValue(readGapfillSlotLabel(span, index));
+            if (!raw) {
+                return;
+            }
+
+            // ① 写入可见内容。先放开 contenteditable，避免某些皮肤置为只读。
+            span.setAttribute('contenteditable', 'true');
+            span.textContent = raw;
+            span.style.display = 'inline';
+            span.style.width = 'auto';
+
+            // 问卷星靠 initStyle 表示「空」，填了值要移除，否则样式上仍像未填
+            const labelEl = span.closest && span.closest('.textEdit');
+            if (labelEl) {
+                labelEl.classList.remove('initStyle');
+            }
+
+            span.dispatchEvent(new Event('input', { bubbles: true }));
+            span.dispatchEvent(new Event('keyup', { bubbles: true }));
+            // ② 触发 blur，让页面的回调把 textContent 同步进隐藏 input
+            span.dispatchEvent(new Event('blur', { bubbles: false }));
+            span.dispatchEvent(new Event('blur', { bubbles: true }));
+
+            // 兜底：若页面未绑定回调（或事件未生效），直接写隐藏 input 并通知校验
+            const hiddenInput = findGapfillInput(span);
+            if (hiddenInput && String(hiddenInput.value || '') !== raw) {
+                hiddenInput.value = raw;
+                hiddenInput.dispatchEvent(new Event('input', { bubbles: true }));
+                hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
+                hiddenInput.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+
+            const synced = hiddenInput ? String(hiddenInput.value || '') === raw : span.textContent.trim() === raw;
+            if (synced) {
+                filled += 1;
+            } else {
+                logWarning('填空组单格未同步成功', { index, raw, inputValue: hiddenInput && hiddenInput.value });
+            }
+        });
+
+        return filled > 0;
+    }
+
+    // 找某个 contenteditable 空格对应的取值 input：
+    // 结构是 input（可能包在 .ui-input-text 里）紧邻其后的 label.textEdit > span.textCont。
+    function findGapfillInput(span) {
+        const labelEl = span.closest && span.closest('.textEdit');
+        if (!labelEl) {
+            return null;
+        }
+        let node = labelEl.previousElementSibling;
+        // 最多往前找两层（.ui-input-text 包裹层 + input 自身）
+        for (let i = 0; i < 3 && node; i++) {
+            if (node.tagName === 'INPUT') {
+                return node;
+            }
+            const inner = node.querySelector && node.querySelector('input');
+            if (inner) {
+                return inner;
+            }
+            node = node.previousElementSibling;
+        }
+        return null;
+    }
+
     function fillProportion(node, question) {
         const inputs = getProportionInputs(node);
         if (!inputs.length) {
@@ -5405,7 +6157,7 @@
         const highlighted = [];
         getVisibleQuestionNodes().forEach((node) => {
             const questionId = extractQuestionId(node, 0);
-            const question = State.config.questions.find((item) => String(item.id) === String(questionId));
+            const question = findConfigQuestionForNode(questionId, node);
             if (!question || question.enabled === false) {
                 return;
             }
@@ -5494,7 +6246,7 @@
                     if (relations.length && !isRelationSatisfied(relations)) {
                         continue;
                     }
-                    const question = State.config.questions.find((item) => String(item.id) === String(questionId));
+                    const question = findConfigQuestionForNode(questionId, node);
                     if (!question || question.enabled === false) {
                         continue;
                     }
