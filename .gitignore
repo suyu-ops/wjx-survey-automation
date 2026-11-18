@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+package-lock.json
+
+# 调试与临时文件
+_debug/
+dist/
+debug.log
+*.tmp
+*.log
+
+# 测试运行产物（fixture 页面、测量结果）
+# 其中 tests/out/upstream.user.js 是上游 4.1.4 的比对副本（MIT），
+# 属于第三方代码，不入库；缺失时 perf / scale 会自动跳过上游对照。
+tests/out/
+
+# 工具本地状态
+.zcode/
+
+# 历史备份（本地保留，不入库）
+*.bak.*
+
+# 与本项目无关的草稿，留在本地
+docs/issue-draft.md

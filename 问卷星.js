@@ -1,8 +1,11 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      0.1.18
+// @version      2.0.0
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 2.0.0 - 版本号里程碑：0.1.x 系列收束为 2.0.0，本版**不含功能改动**，内容与 0.1.20 完全一致。之所以一次性跨过 1.x：0.1.16-0.1.20 五个版本把「填写正确性」从事件契约层（keyup/blur/click 复刻、GB 11643 校验位、内嵌填空 otherTextEvent）到配置同步层（分页后模型驱动 collectCurrentQuestionsFromDom、randomizeAllQuestions 覆盖全页）都补齐了，配上 161 项自动化断言，才算第一份敢让人长期用的稳定版；0.1.x 的名字已不足以描述它。历史条目原样保留在下方，未做删改。
+// @updateLog 0.1.20 - 面板重做与题目分页：① 按设计稿重做面板视觉（纯 CSS 实现，不引入 Tailwind CDN，避免 @grant none 下的外部依赖与断网失效）：标题栏加品牌图标、统计卡改渐变、分配模式改分段控件、主 CTA 拆到常驻底部操作栏。② 面板改为纯固定定位（position: fixed，右上角），移除 0.1.1 引入的拖拽逻辑与 _PANEL_POSITION 位置记忆——可拖动在多页问卷里经常被误拖到屏幕外且无法找回。③ 题目列表改为「列表内独立滚动 + 分页控件」：默认 10 题/页，支持每页条数（10/20/50/200）、上一页/下一页、页码直接跳转，并与搜索/题型筛选联动（改筛选自动回第 1 页，标题旁显示「已匹配 x / y 道」，无匹配给出明确空态）。这解决了题目多时必须一直往下翻的问题：147 题时面板渲染从 55.6ms 降到 27.1ms、卡片数从 148 张恒定降到 10 张，且此时已快于上游原版（35.3ms）。④ 分页的关键安全改动：collectCurrentQuestionsFromDom 改为模型驱动——旧实现「以 DOM 卡片为准重建配置数组」，分页后 DOM 只有当前页卡片，任何 syncStateFromDom+saveConfig 都会把未渲染页的配置从 localStorage 静默抹掉；现在以 State.config.questions 为骨架，只覆盖当前 DOM 中存在的卡片的可编辑字段。⑤ 同源缺陷一并修复：randomizeAllQuestions 旧实现遍历 DOM 卡片，分页后「一键随机全部」只会随机当前页，其余题的旧值会一直带到提交；现在改为按模型遍历全部题目并顺带回写已渲染卡片，同时把父子排序从「按卡片排序」改为「按模型关联深度排序」（卡片排序在分页后找不到父题，数量模式下会让子题按父题旧值算次数）。
+// @updateLog 0.1.19 - 修复选项内嵌填空（复合题）写不进答案表：问卷星给 input.OtherText / input.OtherRadioText 绑定的是 "blur keyup"——keyup 走 otherTextEvent 把值同步进选项对象，blur 才调用 saveAnswer。此前这里只派发 input/change，界面看着填上了、答案表里却是空的，提交时该题仍被判「未作答」；现在统一走 writeTextInput（focus + input/change + keyup + blur），与填空题保持同一套事件序列。同时补上两处调用点的返回值检查：内嵌框写不进去时用 logWarning 报出来，不再静默当作成功。配额回滚 withQuotaRollback 的读取/恢复失败也从空 catch 改为 logWarning，避免份数凭空减少却查不到原因。清理从未被读写过的 optionTexts 字段（实际使用的是 optionFills）。
 // @updateLog 0.1.18 - 修复身份证题与填空组（出生日期）填不上：① 身份证号的第 18 位是 GB 11643 加权校验码，此前生成器「前 17 位随机、末位随便写」，11 次里有 10 次会被问卷星的 checkIDCard 判「请输入正确的身份证号」，用户手填的号码也会被同样拒绝；现在按国标真算校验码，候选内容也改用完整校验（不再只判 18 位格式），实测生成的号码 500/500 通过问卷星自身的校验函数。② 填空题只派发 input/change，而问卷星在 input 上绑定的是 "keyup blur click"（verifyTxt + saveAnswer），导致界面有值但页面未校验、未存答案；现在补齐 focus/keyup/blur，让页面回调真正跑一遍。③ 填空组（type=9 / gapfill，如「出生日期：__年__月__日」）未被调用的根因是按题号 find 配置时不比对题型，升级后旧配置里的 unknown 条目抢先命中、走到 default 分支返回 false，页面即报「请回答此题」；现在同步时清理同题号的过时题型条目，并让查找同时匹配页面实际题型。
 // @updateLog 0.1.17 - 填空题按校验类型细分显示与提示：此前所有 text 题型在面板上一律标为「填空题」，号码题（verify='手机'）虽已正确填入 11 位号码、数字题虽已按数值填充，但用户无法从面板判断脚本会写什么；现在标签按 textRequirement 显示为「号码题 / 数字题 / 身份证题 / 邮箱题」，卡片副标题给出「按手机号格式填充」等说明，题型筛选新增这四个细分项。同时补上弹层选择类题目处理：问卷星的「多级下拉」（verify='多级下拉' + input[readonly] + onclick=openCityBox）校验的是弹层内部选中状态，直接写 value 只会留下页面不认的假值，提交时仍报未作答；现在扫描时标记 pickerBased，填写时跳过并在面板提示「需手动选择」，避免静默填错掩盖问题。
 // @updateLog 0.1.14 - 风控识别与自我保护：连续多次未通过人机验证时不再空撞，自动暂停并提示「疑似设备/IP 被风控、建议换网络」，避免把风控等级撞高；「设计份数」输入框下方新增份数建议提示，超过 100 份时用醒目样式提醒分批执行；「清除本地数据」按钮扩展为同时清理问卷星的作答残留（wjxanswerdata 等）与设备标识 Cookie（uuuvid / _c_WBKFRo / jac* / SERVERID），并在提示中给出换网络与冷却引导。
@@ -143,65 +146,127 @@
             distributionMode: 'ratio',
             speedProfile: 'normal',
             questions: []
+        },
+        // 题目列表分页视图状态。只影响渲染，不进入配置、不入 localStorage：
+        // 用户换页不该触发配置保存，也不该被当成「配置已修改」。
+        pager: {
+            page: 1,
+            pageSize: 10
         }
     };
 
+    // 每页条数候选。10 条对应面板可视高度约一屏半，是默认值；
+    // 200 相当于「不分页」，给习惯整体扫一遍的用户留出口。
+    const PAGER_PAGE_SIZES = [10, 20, 50, 200];
+    const PAGER_DEFAULT_PAGE_SIZE = 10;
+
     const STYLE_TEXT = `
         :root {
-            --wjx-bg: #f5f9ff;
+            --wjx-bg: #f5f8ff;
             --wjx-surface: #ffffff;
             --wjx-surface-strong: #ffffff;
-            --wjx-primary: #0064ff;
-            --wjx-primary-deep: #0052d9;
-            --wjx-primary-soft: #edf4ff;
-            --wjx-line: #d7e6ff;
-            --wjx-text: #1f2d3d;
-            --wjx-subtle: #5f6f82;
-            --wjx-shadow: 0 10px 28px rgba(23, 80, 179, 0.10);
+            --wjx-primary: #2563eb;
+            --wjx-primary-deep: #1d4ed8;
+            --wjx-primary-soft: #eff6ff;
+            --wjx-brand-100: #dbeafe;
+            --wjx-line: #e2e8f0;
+            --wjx-line-soft: #f1f5f9;
+            --wjx-text: #0f172a;
+            --wjx-subtle: #64748b;
+            --wjx-muted: #94a3b8;
+            --wjx-shadow: 0 8px 30px rgba(0, 0, 0, 0.06);
+            --wjx-card-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.05), 0 2px 6px -1px rgba(15, 23, 42, 0.02);
         }
         #${PANEL_ID} {
             position: fixed;
             top: 16px;
             right: 16px;
-            width: 402px;
-            min-width: 320px;
+            width: 420px;
+            min-width: 340px;
             max-width: min(560px, calc(100vw - 32px));
             max-height: calc(100vh - 32px);
             z-index: 2147483647;
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            border-radius: 10px;
-            border: 1px solid var(--wjx-line);
+            box-sizing: border-box;
+            border-radius: 18px;
+            border: 1px solid rgba(226, 232, 240, 0.9);
             background: var(--wjx-surface);
             color: var(--wjx-text);
-            box-shadow: var(--wjx-shadow);
-            font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+            box-shadow: var(--wjx-shadow), 0 2px 6px rgba(15, 23, 42, 0.04);
+            font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            -webkit-font-smoothing: antialiased;
         }
         #${PANEL_ID}.is-collapsed {
             width: 240px;
+            height: auto;
+        }
+        #${PANEL_ID}.is-collapsed .wjx-footer {
+            display: none;
         }
         #${PANEL_ID}.is-automation-hidden {
             display: none !important;
         }
+        /* 面板内统一收窄滚动条（设计稿的 custom-scrollbar） */
+        #${PANEL_ID} ::-webkit-scrollbar {
+            width: 5px;
+            height: 5px;
+        }
+        #${PANEL_ID} ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        #${PANEL_ID} ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 9999px;
+        }
+        #${PANEL_ID} ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
         .wjx-head {
-            padding: 16px;
-            background: linear-gradient(180deg, #f8fbff, #edf4ff);
+            flex: 0 0 auto;
+            padding: 10px 14px;
+            background: rgba(255, 255, 255, 0.92);
             color: var(--wjx-text);
-            border-bottom: 1px solid var(--wjx-line);
-            border-top: 3px solid var(--wjx-primary);
+            border-bottom: 1px solid var(--wjx-line-soft);
         }
         .wjx-head-top {
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             justify-content: space-between;
-            gap: 12px;
+            gap: 10px;
+        }
+        .wjx-brand {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            min-width: 0;
+        }
+        .wjx-brand-icon {
+            display: grid;
+            flex: 0 0 32px;
+            width: 32px;
+            height: 32px;
+            place-items: center;
+            border-radius: 11px;
+            color: #ffffff;
+            background: linear-gradient(135deg, #2563eb, #6366f1);
+            box-shadow: 0 4px 10px -4px rgba(37, 99, 235, 0.6);
+        }
+        .wjx-brand-icon svg {
+            width: 16px;
+            height: 16px;
+        }
+        .wjx-brand-text {
+            min-width: 0;
         }
         .wjx-title {
             margin: 0;
-            font-size: 18px;
+            font-size: 15.5px;
             font-weight: 700;
-            letter-spacing: 0;
+            line-height: 1.2;
+            letter-spacing: -0.01em;
+            color: var(--wjx-text);
         }
         .wjx-author {
             margin-top: 4px;
@@ -209,67 +274,108 @@
             font-weight: 700;
             color: var(--wjx-subtle);
         }
+        .wjx-subtitle {
+            display: block;
+            margin-top: 2px;
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--wjx-primary);
+            opacity: 0.85;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
         .wjx-toggle {
-            border: 1px solid #b9d2ff;
-            border-radius: 6px;
-            padding: 6px 12px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 28px;
+            padding: 0 10px;
+            border: 1px solid var(--wjx-line);
+            border-radius: 9999px;
+            background: #f8fafc;
+            color: var(--wjx-subtle);
             font-size: 11px;
-            font-weight: 700;
-            color: var(--wjx-primary-deep);
-            background: #ffffff;
+            font-weight: 600;
             cursor: pointer;
             flex-shrink: 0;
+            transition: background-color 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+        }
+        .wjx-toggle:hover {
+            background: var(--wjx-line-soft);
+            border-color: #cbd5e1;
+            color: var(--wjx-text);
         }
         #${PANEL_ID} .wjx-head-actions {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 7px;
             flex-shrink: 0;
         }
         #${PANEL_ID} .wjx-feedback-link {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            min-height: 30px;
-            padding: 0 9px;
+            min-height: 28px;
+            padding: 0 11px;
             box-sizing: border-box;
-            border-radius: 6px;
+            border-radius: 9999px;
             color: #ffffff;
-            background: linear-gradient(135deg, #12b7f5, #1286e8);
-            box-shadow: 0 4px 10px -5px rgba(18, 134, 232, 0.75);
+            background: linear-gradient(100deg, #3b82f6, #2563eb);
+            box-shadow: 0 4px 10px -6px rgba(37, 99, 235, 0.8);
             text-decoration: none;
             font-size: 11px;
-            font-weight: 700;
+            font-weight: 600;
             white-space: nowrap;
-            transition: filter 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+            transition: filter 0.18s ease, box-shadow 0.18s ease;
         }
         #${PANEL_ID} .wjx-feedback-link:hover {
             color: #ffffff;
-            filter: brightness(1.08);
-            transform: translateY(-1px);
-            box-shadow: 0 7px 14px -6px rgba(18, 134, 232, 0.85);
+            filter: brightness(1.06);
+            box-shadow: 0 7px 14px -6px rgba(37, 99, 235, 0.85);
         }
         #${PANEL_ID} .wjx-feedback-link:focus-visible {
-            outline: 3px solid rgba(18, 134, 232, 0.25);
+            outline: 3px solid rgba(37, 99, 235, 0.25);
             outline-offset: 2px;
         }
+        /* 唯一的滚动容器：面板高度固定，设置区与题目区共享这一层滚动。
+           题目列表本身另做一层独立滚动（见 .wjx-questions-body），
+           这样翻页控件不会跟着长列表滚出视野。 */
         .wjx-body {
-            padding: 16px;
+            flex: 1 1 auto;
+            min-height: 0;
+            padding: 12px;
             overflow-y: auto;
+            overscroll-behavior: contain;
             background: var(--wjx-bg);
         }
         .wjx-section {
-            margin-bottom: 14px;
+            margin-bottom: 10px;
             padding: 14px;
-            border-radius: 8px;
+            border-radius: 16px;
             background: var(--wjx-surface);
             border: 1px solid var(--wjx-line);
+            box-shadow: var(--wjx-card-shadow);
+        }
+        .wjx-section:last-child {
+            margin-bottom: 0;
         }
         .wjx-section-title {
+            display: flex;
+            align-items: center;
+            gap: 6px;
             margin: 0 0 10px;
             font-size: 13px;
             font-weight: 700;
-            color: var(--wjx-primary-deep);
+            color: var(--wjx-text);
+        }
+        .wjx-section-title::before {
+            content: "";
+            display: block;
+            width: 6px;
+            height: 14px;
+            border-radius: 9999px;
+            background: var(--wjx-primary);
         }
         .wjx-metrics {
             display: grid;
@@ -278,35 +384,58 @@
         }
         .wjx-metric {
             padding: 12px;
-            border-radius: 8px;
-            background: var(--wjx-surface-strong);
-            border: 1px solid var(--wjx-line);
+            border-radius: 14px;
+            background: linear-gradient(160deg, rgba(239, 246, 255, 0.9), #ffffff);
+            border: 1px solid var(--wjx-brand-100);
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
         }
         .wjx-metric span {
             display: block;
         }
         .wjx-metric-label {
             font-size: 11px;
+            font-weight: 500;
             color: var(--wjx-subtle);
-            margin-bottom: 4px;
+            margin-bottom: 2px;
         }
         .wjx-metric-value {
-            font-size: 18px;
+            font-size: 22px;
             font-weight: 800;
+            letter-spacing: -0.02em;
+            line-height: 1.2;
+            color: var(--wjx-text);
         }
         #${PANEL_ID} .wjx-tiku-promo {
-            margin: 0 0 14px;
-            padding: 10px;
-            border: 1px solid rgba(14, 165, 233, 0.30);
-            border-radius: 9px;
-            background: linear-gradient(135deg, rgba(14, 165, 233, 0.09), rgba(16, 185, 129, 0.08));
-            box-shadow: 0 7px 18px -14px rgba(14, 116, 144, 0.52);
+            position: relative;
+            margin: 0 0 10px;
+            padding: 13px;
+            border: 1px solid rgba(30, 41, 59, 0.9);
+            border-radius: 16px;
+            background: linear-gradient(100deg, #0f172a, #1e1b4b);
+            box-shadow: 0 4px 16px -6px rgba(15, 23, 42, 0.5);
+            overflow: hidden;
+        }
+        /* 设计稿里的背景氛围圆：用伪元素实现，不额外占 DOM 节点 */
+        #${PANEL_ID} .wjx-tiku-promo::after {
+            content: "";
+            position: absolute;
+            right: -24px;
+            bottom: -24px;
+            width: 96px;
+            height: 96px;
+            border-radius: 50%;
+            background: rgba(59, 130, 246, 0.2);
+            filter: blur(18px);
+            pointer-events: none;
         }
         #${PANEL_ID} .wjx-tiku-promo-top {
+            position: relative;
+            z-index: 1;
             display: flex;
-            align-items: center;
-            gap: 8px;
+            align-items: flex-start;
+            gap: 10px;
             min-width: 0;
+            margin-bottom: 11px;
         }
         #${PANEL_ID} .wjx-tiku-promo-icon {
             display: grid;
@@ -314,104 +443,128 @@
             width: 30px;
             height: 30px;
             place-items: center;
-            border-radius: 9px;
-            color: #0284c7;
-            background: #ffffff;
-            box-shadow: 0 5px 11px -8px rgba(2, 132, 199, 0.65);
-            font-size: 16px;
+            border-radius: 10px;
+            color: #fcd34d;
+            background: rgba(255, 255, 255, 0.12);
+            font-size: 15px;
         }
         #${PANEL_ID} .wjx-tiku-promo-copy {
             display: flex;
             flex: 1;
             flex-direction: column;
             min-width: 0;
-            gap: 1px;
+            gap: 2px;
         }
         #${PANEL_ID} .wjx-tiku-promo-copy strong {
-            color: #0369a1;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+            color: #ffffff;
             font-size: 12.5px;
-            font-weight: 800;
+            font-weight: 600;
             line-height: 1.3;
         }
+        #${PANEL_ID} .wjx-tiku-promo-copy strong em {
+            padding: 1px 6px;
+            border-radius: 9999px;
+            border: 1px solid rgba(96, 165, 250, 0.35);
+            background: rgba(59, 130, 246, 0.3);
+            color: #bfdbfe;
+            font-size: 10px;
+            font-style: normal;
+            font-weight: 500;
+        }
         #${PANEL_ID} .wjx-tiku-promo-copy small {
-            color: #52708a;
-            font-size: 10.5px;
-            font-weight: 600;
+            color: rgba(203, 213, 225, 0.9);
+            font-size: 11.5px;
+            font-weight: 400;
             line-height: 1.4;
         }
         #${PANEL_ID} .wjx-tiku-promo-actions {
-            display: flex;
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 7px;
-            margin-top: 9px;
         }
         #${PANEL_ID} .wjx-tiku-promo-link {
             display: inline-flex;
             flex: 1;
             align-items: center;
             justify-content: center;
-            min-height: 29px;
+            min-height: 30px;
             padding: 0 8px;
-            border: 1px solid rgba(2, 132, 199, 0.52);
-            border-radius: 7px;
-            color: #0369a1;
-            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 10px;
+            color: #ffffff;
+            background: rgba(255, 255, 255, 0.1);
             text-decoration: none;
-            font-size: 10.5px;
-            font-weight: 800;
+            font-size: 11px;
+            font-weight: 500;
             line-height: 1;
-            transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+            transition: background-color 0.18s ease, border-color 0.18s ease;
         }
         #${PANEL_ID} .wjx-tiku-promo-link:hover {
-            border-color: #0284c7;
+            border-color: rgba(255, 255, 255, 0.28);
             color: #ffffff;
-            background: #0284c7;
-            box-shadow: 0 7px 14px -8px rgba(2, 132, 199, 0.68);
-            transform: translateY(-1px);
+            background: rgba(255, 255, 255, 0.2);
         }
         #${PANEL_ID} .wjx-tiku-promo-link:focus-visible {
-            outline: 3px solid rgba(14, 165, 233, 0.24);
+            outline: 3px solid rgba(96, 165, 250, 0.45);
             outline-offset: 2px;
         }
         .wjx-field {
             display: flex;
             flex-direction: column;
             gap: 6px;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
         }
         .wjx-field label {
             font-size: 12px;
-            font-weight: 700;
+            font-weight: 600;
+            color: #334155;
         }
         .wjx-input,
         .wjx-textarea {
             width: 100%;
             box-sizing: border-box;
-            border: 1px solid #c9dbff;
-            border-radius: 6px;
-            padding: 10px 12px;
+            border: 1px solid var(--wjx-line);
+            border-radius: 11px;
+            padding: 8px 12px;
             font-size: 13px;
+            font-family: inherit;
             color: var(--wjx-text);
             background: #ffffff;
             outline: none;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease;
+        }
+        .wjx-input:hover:not(:focus),
+        .wjx-textarea:hover:not(:focus) {
+            border-color: #cbd5e1;
         }
         .wjx-input:focus,
         .wjx-textarea:focus {
-            border-color: #7fb0ff;
-            box-shadow: 0 0 0 3px rgba(0,100,255,0.10);
+            border-color: var(--wjx-primary);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
         }
         .wjx-textarea {
-            min-height: 88px;
+            min-height: 84px;
             resize: vertical;
-            line-height: 1.5;
+            line-height: 1.6;
         }
         .wjx-field-hint {
             margin-top: -2px;
             font-size: 11px;
-            line-height: 1.5;
+            line-height: 1.55;
             color: var(--wjx-subtle);
         }
         .wjx-field-hint.is-warn {
-            color: #b45309;
+            padding: 7px 9px;
+            border-radius: 10px;
+            border: 1px solid rgba(251, 191, 36, 0.55);
+            background: rgba(255, 251, 235, 0.9);
+            color: #92400e;
         }
         .wjx-option-fill-row {
             display: grid;
@@ -422,47 +575,59 @@
         }
         .wjx-option-fill-row > span {
             font-size: 12px;
-            font-weight: 700;
+            font-weight: 600;
+            color: #334155;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        /* 分段控件（比例模式 / 数量模式）：底层为浅灰轨道，选中项为实心蓝块 */
         .wjx-mode-switch {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 8px;
+            gap: 4px;
+            padding: 4px;
+            border-radius: 12px;
+            border: 1px solid rgba(226, 232, 240, 0.8);
+            background: rgba(241, 245, 249, 0.9);
         }
         .wjx-mode-btn {
-            min-height: 36px;
-            border-radius: 6px;
+            min-height: 32px;
+            border: 1px solid transparent;
+            border-radius: 9px;
             padding: 0 10px;
             font-size: 12px;
-            font-weight: 700;
+            font-weight: 600;
             cursor: pointer;
+            color: var(--wjx-subtle);
+            background: transparent;
+            transition: background-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+        }
+        .wjx-mode-btn:hover:not(.is-active) {
             color: var(--wjx-text);
-            background: #ffffff;
-            border: 1px solid #c9dbff;
+            background: rgba(226, 232, 240, 0.6);
         }
         .wjx-mode-btn.is-active {
             color: #ffffff;
+            font-weight: 700;
             background: var(--wjx-primary);
-            border-color: var(--wjx-primary);
+            box-shadow: 0 1px 3px rgba(37, 99, 235, 0.32);
         }
         .wjx-mode-hint {
             margin: 0 0 10px;
             font-size: 11px;
-            line-height: 1.5;
+            line-height: 1.55;
             color: var(--wjx-subtle);
         }
         .wjx-count-hint {
             margin: 6px 0 0;
             font-size: 11px;
-            line-height: 1.5;
+            line-height: 1.55;
             color: var(--wjx-subtle);
         }
         .wjx-count-hint.is-warning {
-            color: #d4380d;
-            font-weight: 700;
+            color: #b91c1c;
+            font-weight: 600;
         }
         .wjx-actions {
             display: grid;
@@ -470,13 +635,17 @@
             gap: 8px;
         }
         .wjx-btn {
-            min-height: 40px;
-            border-radius: 6px;
+            min-height: 36px;
+            border-radius: 11px;
             padding: 0 12px;
-            font-size: 13px;
-            font-weight: 700;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: inherit;
             cursor: pointer;
-            transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+            transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease, transform 0.1s ease;
+        }
+        .wjx-btn:active {
+            transform: scale(0.985);
         }
         .wjx-btn:hover {
             filter: none;
@@ -485,57 +654,92 @@
             color: #ffffff;
             background: var(--wjx-primary);
             border: 1px solid var(--wjx-primary);
+            box-shadow: 0 2px 8px -2px rgba(37, 99, 235, 0.35);
+        }
+        .wjx-btn-primary:hover {
+            background: var(--wjx-primary-deep);
+            border-color: var(--wjx-primary-deep);
         }
         .wjx-btn-secondary {
-            color: var(--wjx-text);
+            color: #334155;
             background: #ffffff;
-            border: 1px solid #c9dbff;
+            border: 1px solid var(--wjx-line);
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+        }
+        .wjx-btn-secondary:hover {
+            background: #f8fafc;
+            border-color: #cbd5e1;
+        }
+        /* 主 CTA：渐变实心，放在设置区底部，与设计稿的一级按钮一致 */
+        .wjx-btn-cta {
+            grid-column: span 2;
+            min-height: 44px;
+            font-size: 13.5px;
+            font-weight: 700;
+            letter-spacing: 0.01em;
+            color: #ffffff;
+            background: linear-gradient(100deg, #2563eb, #4f46e5);
+            border: 1px solid transparent;
+            border-radius: 14px;
+            box-shadow: 0 6px 16px -6px rgba(37, 99, 235, 0.55);
+        }
+        .wjx-btn-cta:hover {
+            filter: brightness(1.05);
         }
         .wjx-list {
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 10px;
         }
         .wjx-card {
-            padding: 14px;
-            border-radius: 8px;
+            padding: 13px;
+            border-radius: 16px;
             background: var(--wjx-surface-strong);
-            border: 1px solid var(--wjx-line);
+            border: 1px solid rgba(219, 234, 254, 0.9);
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
+            transition: border-color 0.18s ease, box-shadow 0.18s ease;
+        }
+        .wjx-card:hover {
+            border-color: #bfdbfe;
+            box-shadow: 0 4px 14px -6px rgba(37, 99, 235, 0.22);
         }
         .wjx-card-head {
             display: flex;
             justify-content: space-between;
             align-items: flex-start;
-            gap: 12px;
-            margin-bottom: 8px;
+            gap: 10px;
+            margin-bottom: 6px;
         }
         .wjx-card-title {
-            font-size: 13px;
-            font-weight: 800;
-            line-height: 1.5;
+            font-size: 13.5px;
+            font-weight: 700;
+            line-height: 1.45;
+            color: var(--wjx-text);
+            overflow-wrap: anywhere;
         }
         .wjx-card-type {
             flex-shrink: 0;
-            padding: 5px 9px;
-            border-radius: 6px;
+            padding: 3px 8px;
+            border-radius: 7px;
             background: var(--wjx-primary-soft);
             color: var(--wjx-primary-deep);
-            font-size: 11px;
-            font-weight: 700;
-            border: 1px solid #cfe0ff;
+            font-size: 10.5px;
+            font-weight: 600;
+            border: 1px solid rgba(191, 219, 254, 0.9);
+            white-space: nowrap;
         }
         .wjx-card-meta {
             margin-bottom: 10px;
             color: var(--wjx-subtle);
             font-size: 11px;
-            line-height: 1.45;
+            line-height: 1.5;
         }
         .wjx-count-hint {
             margin: 0 0 8px;
-            font-size: 12px;
-            font-weight: 700;
+            font-size: 11.5px;
+            font-weight: 600;
             color: var(--wjx-primary-deep);
-            line-height: 1.45;
+            line-height: 1.5;
         }
         .wjx-grid {
             display: grid;
@@ -544,15 +748,16 @@
         }
         .wjx-grid-item {
             padding: 8px;
-            border-radius: 6px;
-            background: #f7fbff;
-            border: 1px solid #deebff;
+            border-radius: 11px;
+            background: rgba(248, 250, 252, 0.8);
+            border: 1px solid rgba(226, 232, 240, 0.9);
         }
         .wjx-grid-item span {
             display: block;
-            margin-bottom: 6px;
-            font-size: 11px;
-            color: var(--wjx-subtle);
+            margin-bottom: 5px;
+            font-size: 10.5px;
+            font-weight: 600;
+            color: #334155;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -560,11 +765,21 @@
         .wjx-grid-item input {
             width: 100%;
             box-sizing: border-box;
-            border: 1px solid #c9dbff;
-            border-radius: 6px;
-            padding: 8px 10px;
-            font-size: 13px;
+            border: 1px solid var(--wjx-line);
+            border-radius: 9px;
+            padding: 5px 7px;
+            font-size: 12.5px;
+            font-family: inherit;
+            font-weight: 600;
+            text-align: center;
+            color: var(--wjx-text);
             background: #ffffff;
+            outline: none;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease;
+        }
+        .wjx-grid-item input:focus {
+            border-color: var(--wjx-primary);
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
         }
         .wjx-tools {
             display: flex;
@@ -574,39 +789,51 @@
         }
         .wjx-toolbar {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 132px;
-            gap: 8px;
+            grid-template-columns: minmax(0, 1fr) 124px;
+            gap: 7px;
             margin-bottom: 10px;
         }
+        .wjx-toolbar .wjx-input {
+            padding-top: 7px;
+            padding-bottom: 7px;
+            font-size: 12px;
+            background: rgba(248, 250, 252, 0.9);
+        }
+        .wjx-toolbar .wjx-input:focus {
+            background: #ffffff;
+        }
         .wjx-save-status {
-            min-height: 18px;
-            margin-top: 8px;
+            min-height: 16px;
+            margin-top: 6px;
             font-size: 11px;
+            font-weight: 500;
             color: var(--wjx-subtle);
         }
-        .wjx-save-status.is-saved { color: #17864b; }
-        .wjx-save-status.is-error { color: #d4380d; }
+        .wjx-save-status.is-saved { color: #15803d; }
+        .wjx-save-status.is-error { color: #b91c1c; }
         .wjx-weight-bar-wrap {
-            height: 4px;
-            margin-top: 6px;
+            height: 3px;
+            margin-top: 5px;
             overflow: hidden;
-            background: #e8f1ff;
-            border-radius: 2px;
+            background: #e8eefb;
+            border-radius: 9999px;
         }
         .wjx-weight-bar {
             width: 0;
             height: 100%;
+            border-radius: 9999px;
             background: var(--wjx-primary);
             transition: width 0.18s ease;
         }
         .wjx-weight-summary {
             margin-top: 8px;
             font-size: 11px;
+            font-weight: 600;
             color: var(--wjx-subtle);
         }
         .wjx-card.is-disabled { opacity: 0.58; }
         .wjx-card.is-filtered { display: none; }
-        .wjx-card-error { border-color: #ff9c9c; }
+        .wjx-card-error { border-color: #fca5a5; }
         .wjx-preview-highlight {
             outline: 3px solid #ffb020 !important;
             outline-offset: 3px;
@@ -631,20 +858,158 @@
             cursor: pointer;
         }
         .wjx-chip {
-            border: 1px solid #cfe0ff;
-            border-radius: 6px;
-            padding: 6px 10px;
+            border: 1px solid rgba(191, 219, 254, 0.9);
+            border-radius: 9px;
+            padding: 5px 9px;
             font-size: 11px;
-            font-weight: 700;
+            font-weight: 500;
+            font-family: inherit;
             color: var(--wjx-primary-deep);
-            background: var(--wjx-primary-soft);
+            background: rgba(239, 246, 255, 0.75);
             cursor: pointer;
+            transition: background-color 0.18s ease, border-color 0.18s ease, transform 0.1s ease;
+        }
+        .wjx-chip:hover {
+            background: rgba(219, 234, 254, 0.85);
+            border-color: #93c5fd;
+        }
+        .wjx-chip:active {
+            transform: scale(0.96);
         }
         .wjx-empty {
             text-align: center;
             padding: 24px 16px;
             color: var(--wjx-subtle);
+            font-size: 12px;
             line-height: 1.7;
+        }
+        /* ===== 题目列表分页 =====
+           题目区做成「标题+筛选」固定 / 列表独立滚动 / 分页控件固定 的三段结构。
+           此前所有题目卡片平铺在同一个 .wjx-body 里，题目一多整块面板被撑成
+           一条长滚动条，翻页控件和搜索框都会滚出视野。 */
+        .wjx-questions {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        .wjx-questions-head {
+            flex: 0 0 auto;
+        }
+        .wjx-questions-body {
+            flex: 1 1 auto;
+            min-height: 140px;
+            max-height: min(52vh, 520px);
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            padding-right: 2px;
+        }
+        .wjx-pager {
+            flex: 0 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-top: 9px;
+            padding-top: 9px;
+            border-top: 1px solid var(--wjx-line-soft);
+        }
+        .wjx-pager[hidden] {
+            display: none;
+        }
+        .wjx-pager-info {
+            min-width: 0;
+            font-size: 10.5px;
+            font-weight: 500;
+            color: var(--wjx-subtle);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .wjx-pager-controls {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .wjx-pager-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 26px;
+            height: 26px;
+            padding: 0 7px;
+            box-sizing: border-box;
+            border: 1px solid var(--wjx-line);
+            border-radius: 8px;
+            background: #ffffff;
+            color: #334155;
+            font-size: 11px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+        }
+        .wjx-pager-btn:hover:not(:disabled) {
+            background: var(--wjx-primary-soft);
+            border-color: #bfdbfe;
+            color: var(--wjx-primary-deep);
+        }
+        .wjx-pager-btn:disabled {
+            opacity: 0.42;
+            cursor: not-allowed;
+        }
+        .wjx-pager-page {
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--wjx-text);
+            font-variant-numeric: tabular-nums;
+        }
+        .wjx-pager-page-input {
+            width: 34px;
+            height: 26px;
+            padding: 0 2px;
+            box-sizing: border-box;
+            border: 1px solid var(--wjx-line);
+            border-radius: 8px;
+            background: #ffffff;
+            color: var(--wjx-text);
+            font-size: 11px;
+            font-weight: 700;
+            font-family: inherit;
+            text-align: center;
+            outline: none;
+            -moz-appearance: textfield;
+            appearance: textfield;
+        }
+        .wjx-pager-page-input::-webkit-outer-spin-button,
+        .wjx-pager-page-input::-webkit-inner-spin-button {
+            margin: 0;
+            -webkit-appearance: none;
+        }
+        .wjx-pager-page-input:focus {
+            border-color: var(--wjx-primary);
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+        }
+        .wjx-pager-size {
+            height: 26px;
+            padding: 0 4px;
+            box-sizing: border-box;
+            border: 1px solid var(--wjx-line);
+            border-radius: 8px;
+            background: #ffffff;
+            color: #334155;
+            font-size: 10.5px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            outline: none;
+        }
+        .wjx-pager-size:focus {
+            border-color: var(--wjx-primary);
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
         }
         .wjx-toast {
             position: fixed;
@@ -759,6 +1124,44 @@
         .wjx-file-input {
             display: none;
         }
+        /* 底部固定操作栏：主 CTA 常驻可见，不随面板内容滚动 */
+        .wjx-footer {
+            flex: 0 0 auto;
+            padding: 10px 14px 12px;
+            background: rgba(255, 255, 255, 0.94);
+            border-top: 1px solid var(--wjx-line-soft);
+            box-shadow: 0 -6px 16px -12px rgba(15, 23, 42, 0.35);
+        }
+        .wjx-footer-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            width: 100%;
+            min-height: 42px;
+            border: 1px solid transparent;
+            border-radius: 14px;
+            color: #ffffff;
+            background: linear-gradient(100deg, #2563eb, #4f46e5);
+            font-size: 13px;
+            font-weight: 700;
+            font-family: inherit;
+            letter-spacing: 0.01em;
+            cursor: pointer;
+            box-shadow: 0 6px 16px -6px rgba(37, 99, 235, 0.55);
+            transition: filter 0.18s ease, transform 0.1s ease;
+        }
+        .wjx-footer-btn:hover {
+            filter: brightness(1.06);
+        }
+        .wjx-footer-btn:active {
+            transform: scale(0.99);
+        }
+        .wjx-footer-btn svg {
+            width: 15px;
+            height: 15px;
+            flex-shrink: 0;
+        }
         @media (max-width: 640px) {
             #${PANEL_ID} {
                 top: auto;
@@ -772,9 +1175,15 @@
             }
             .wjx-metrics,
             .wjx-actions,
-            .wjx-grid,
             .wjx-toolbar {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            /* 移动端小屏：每题只放两列权重框，三列会把输入框挤到无法点按 */
+            .wjx-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .wjx-questions-body {
+                max-height: none;
             }
         }
     `;
@@ -996,14 +1405,22 @@
         panel.innerHTML = `
             <div class="wjx-head">
                 <div class="wjx-head-top">
-                    <div>
-                        <h2 class="wjx-title">问卷星配置面板</h2>
+                    <div class="wjx-brand">
+                        <span class="wjx-brand-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                            </svg>
+                        </span>
+                        <div class="wjx-brand-text">
+                            <h2 class="wjx-title">问卷星配置面板</h2>
+                            <span class="wjx-subtitle" id="wjx-panel-subtitle">自动化增强扩展</span>
+                        </div>
                     </div>
                     <div class="wjx-head-actions">
                         <a class="wjx-feedback-link"
                            href="https://qm.qq.com/cgi-bin/qm/qr?k=576pg6G95bKB3A1nGXaUo3pY_xYdeBEW&amp;jump_from=webapi&amp;authKey=VEDKaRZobYLzHSWu87P/RqGVH6E7FiPrCfcNpkBURCDt3TbVCWJ8mUZ3yh3obWIa"
                            target="_blank" rel="noopener noreferrer" title="加入 QQ 群反馈问题">QQ群反馈</a>
-                        <button type="button" class="wjx-toggle" id="wjx-toggle-panel">收起</button>
+                        <button type="button" class="wjx-toggle" id="wjx-toggle-panel" aria-label="收起面板">收起</button>
                     </div>
                 </div>
             </div>
@@ -1024,7 +1441,7 @@
                     <div class="wjx-tiku-promo-top">
                         <span class="wjx-tiku-promo-icon" aria-hidden="true">✦</span>
                         <span class="wjx-tiku-promo-copy">
-                            <strong>星夜题库 · 千万免费题库</strong>
+                            <strong>星夜题库<em>千万免费</em></strong>
                             <small>支持 OCS 网课助手接入与配置</small>
                         </span>
                     </div>
@@ -1037,23 +1454,26 @@
                     <h3 class="wjx-section-title">全局设置</h3>
                     <div class="wjx-field">
                         <label for="wjx-target-count">设计份数</label>
-                        <input id="wjx-target-count" class="wjx-input" type="number" min="1" step="1" value="1" />
+                        <input id="wjx-target-count" class="wjx-input" type="number" min="1" step="1" value="1" placeholder="请输入提交份数" />
                         <p class="wjx-count-hint" id="wjx-count-hint" aria-live="polite"></p>
                     </div>
                     <div class="wjx-field">
-                        <label>分配模式</label>
-                        <p class="wjx-mode-hint" id="wjx-mode-hint">比例模式：各选项数值为权重比例。</p>
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                            <label>分配模式</label>
+                            <span style="font-size:11px;color:var(--wjx-muted);" id="wjx-mode-hint-inline">各选项数值为权重比例</span>
+                        </div>
                         <div class="wjx-mode-switch">
                             <button type="button" class="wjx-mode-btn is-active" id="wjx-mode-ratio" data-mode="ratio">比例模式</button>
                             <button type="button" class="wjx-mode-btn" id="wjx-mode-count" data-mode="count">数量模式</button>
                         </div>
+                        <p class="wjx-mode-hint" id="wjx-mode-hint">比例模式：各选项数值为权重比例。</p>
                     </div>
                     <div class="wjx-field">
                         <label for="wjx-speed-profile">填写速度</label>
                         <select id="wjx-speed-profile" class="wjx-input">
-                            <option value="slow">慢速</option>
-                            <option value="normal" selected>正常</option>
-                            <option value="fast">快速</option>
+                            <option value="slow">慢速（模拟真人答题节奏）</option>
+                            <option value="normal" selected>正常（推荐稳妥模式）</option>
+                            <option value="fast">快速（适合批量测试）</option>
                         </select>
                     </div>
                     <div id="wjx-save-status" class="wjx-save-status" aria-live="polite">配置尚未修改</div>
@@ -1063,111 +1483,91 @@
                         <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-export-config">导出当前配置</button>
                         <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-import-config">导入配置</button>
                         <input type="file" id="wjx-import-file" class="wjx-file-input" accept=".json,application/json" />
-                        <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-preview-fill" style="grid-column: span 2; margin-top: 8px;">预览填写（不提交）</button>
-                        <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-preview-plan" style="grid-column: span 2;">预览选择（只高亮）</button>
+                        <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-preview-fill">预览填写（不提交）</button>
+                        <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-preview-plan">预览选择（只高亮）</button>
                         <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-fill-to-submit" style="grid-column: span 2;">填写到提交前暂停</button>
-                        <button type="button" class="wjx-btn wjx-btn-primary" id="wjx-start-automation" style="grid-column: span 2;">开始自动化提交</button>
                         <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-reset-config">恢复默认配置</button>
                         <button type="button" class="wjx-btn wjx-btn-secondary" id="wjx-clear-storage">清除本地数据</button>
                     </div>
                 </section>
-                <section class="wjx-section">
-                    <h3 class="wjx-section-title">题目配置</h3>
-                    <div class="wjx-toolbar">
-                        <input id="wjx-question-search" class="wjx-input" type="search" placeholder="搜索题目标题或编号" />
-                        <select id="wjx-question-type-filter" class="wjx-input">
-                            <option value="all">全部题型</option>
-                            <option value="radio">单选题</option>
-                            <option value="checkbox">多选题</option>
-                            <option value="dropdown">下拉题</option>
-                            <option value="rating">评分题</option>
-                            <option value="matrix">矩阵题</option>
-                            <option value="slide">滑块题</option>
-                            <option value="text">填空题</option>
-                            <option value="text-number">└ 数字题</option>
-                            <option value="text-phone">└ 号码题</option>
-                            <option value="text-idcard">└ 身份证题</option>
-                            <option value="text-email">└ 邮箱题</option>
-                            <option value="location">地区题</option>
-                            <option value="sorting">排序题</option>
-                            <option value="proportion">占比题</option>
-                            <option value="gapfill">填空组</option>
-                        </select>
+                <section class="wjx-section wjx-questions">
+                    <div class="wjx-questions-head">
+                        <h3 class="wjx-section-title">题目配置<span id="wjx-match-summary" style="margin-left:auto;font-size:10.5px;font-weight:500;color:var(--wjx-muted);"></span></h3>
+                        <div class="wjx-toolbar">
+                            <input id="wjx-question-search" class="wjx-input" type="search" placeholder="搜索题目编号或标题" />
+                            <select id="wjx-question-type-filter" class="wjx-input">
+                                <option value="all">全部题型</option>
+                                <option value="radio">单选题</option>
+                                <option value="checkbox">多选题</option>
+                                <option value="dropdown">下拉题</option>
+                                <option value="rating">评分题</option>
+                                <option value="matrix">矩阵题</option>
+                                <option value="slide">滑块题</option>
+                                <option value="text">填空题</option>
+                                <option value="text-number">└ 数字题</option>
+                                <option value="text-phone">└ 号码题</option>
+                                <option value="text-idcard">└ 身份证题</option>
+                                <option value="text-email">└ 邮箱题</option>
+                                <option value="location">地区题</option>
+                                <option value="sorting">排序题</option>
+                                <option value="proportion">占比题</option>
+                                <option value="gapfill">填空组</option>
+                            </select>
+                        </div>
                     </div>
-                    <div id="wjx-question-list" class="wjx-list"></div>
+                    <div id="wjx-question-list" class="wjx-list wjx-questions-body"></div>
+                    <div class="wjx-pager" id="wjx-question-pager" hidden>
+                        <span class="wjx-pager-info" id="wjx-pager-info">共 0 题</span>
+                        <div class="wjx-pager-controls">
+                            <select class="wjx-pager-size" id="wjx-pager-size" title="每页显示题数">
+                                <option value="10">10/页</option>
+                                <option value="20">20/页</option>
+                                <option value="50">50/页</option>
+                                <option value="200">200/页</option>
+                            </select>
+                            <button type="button" class="wjx-pager-btn" id="wjx-pager-prev" title="上一页" aria-label="上一页">‹</button>
+                            <span class="wjx-pager-page">
+                                <input class="wjx-pager-page-input" id="wjx-pager-page" type="number" min="1" step="1" value="1" aria-label="当前页码" title="输入页码后回车可跳转" />
+                                <span aria-hidden="true">/</span>
+                                <span id="wjx-pager-total-pages">1</span>
+                            </span>
+                            <button type="button" class="wjx-pager-btn" id="wjx-pager-next" title="下一页" aria-label="下一页">›</button>
+                        </div>
+                    </div>
                 </section>
+            </div>
+            <div class="wjx-footer">
+                <button type="button" class="wjx-footer-btn" id="wjx-start-automation">
+                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"></path></svg>
+                    <span>开始自动化提交</span>
+                </button>
             </div>
         `;
         document.body.appendChild(panel);
         bindEvents(panel);
-        bindPanelDragging(panel);
     }
 
-    function bindPanelDragging(panel) {
-        const head = panel.querySelector('.wjx-head');
-        if (!head) {
+    // 折叠/展开面板。折叠后只留下标题栏（footer 的 CTA 一并隐藏，
+    // 否则折叠状态下底部会孤零零挂着一个大按钮）。
+    function setPanelCollapsed(panel, collapsed) {
+        if (!panel) {
             return;
         }
-        let dragging = false;
-        let offsetX = 0;
-        let offsetY = 0;
-        head.addEventListener('pointerdown', (event) => {
-            if (event.target.closest('a, button, input, select')) {
-                return;
-            }
-            const rect = panel.getBoundingClientRect();
-            dragging = true;
-            offsetX = event.clientX - rect.left;
-            offsetY = event.clientY - rect.top;
-            head.setPointerCapture && head.setPointerCapture(event.pointerId);
-        });
-        head.addEventListener('pointermove', (event) => {
-            if (!dragging || window.matchMedia('(max-width: 640px)').matches) {
-                return;
-            }
-            const left = Math.max(8, Math.min(window.innerWidth - panel.offsetWidth - 8, event.clientX - offsetX));
-            const top = Math.max(8, Math.min(window.innerHeight - 80, event.clientY - offsetY));
-            panel.style.left = `${left}px`;
-            panel.style.top = `${top}px`;
-            panel.style.right = 'auto';
-            panel.style.bottom = 'auto';
-        });
-        const release = () => {
-            if (!dragging) {
-                return;
-            }
-            dragging = false;
-            try {
-                localStorage.setItem(`${State.surveyKey}_PANEL_POSITION`, JSON.stringify({
-                    left: panel.style.left,
-                    top: panel.style.top
-                }));
-            } catch (error) {}
-        };
-        head.addEventListener('pointerup', release);
-        head.addEventListener('pointercancel', release);
-        try {
-            const position = JSON.parse(localStorage.getItem(`${State.surveyKey}_PANEL_POSITION`) || 'null');
-            if (position && position.left && position.top && !window.matchMedia('(max-width: 640px)').matches) {
-                // 恢复位置时钳制在视口内，防止窗口缩放后面板跑出屏幕
-                const left = Math.max(8, Math.min(Number(position.left.replace('px', '')) || 8, window.innerWidth - panel.offsetWidth - 8));
-                const top = Math.max(8, Math.min(Number(position.top.replace('px', '')) || 8, window.innerHeight - 80));
-                panel.style.left = `${left}px`;
-                panel.style.top = `${top}px`;
-                panel.style.right = 'auto';
-                panel.style.bottom = 'auto';
-            }
-        } catch (error) {}
+        panel.classList.toggle('is-collapsed', collapsed);
+        const body = panel.querySelector('#wjx-panel-body');
+        if (body) {
+            body.classList.toggle('wjx-hidden', collapsed);
+        }
+        const button = panel.querySelector('#wjx-toggle-panel');
+        if (button) {
+            button.textContent = collapsed ? '展开' : '收起';
+            button.setAttribute('aria-label', collapsed ? '展开面板' : '收起面板');
+        }
     }
 
     function bindEvents(panel) {
         panel.querySelector('#wjx-toggle-panel').addEventListener('click', () => {
-            panel.classList.toggle('is-collapsed');
-            const body = panel.querySelector('#wjx-panel-body');
-            const button = panel.querySelector('#wjx-toggle-panel');
-            const collapsed = panel.classList.contains('is-collapsed');
-            body.classList.toggle('wjx-hidden', collapsed);
-            button.textContent = collapsed ? '展开' : '收起';
+            setPanelCollapsed(panel, !panel.classList.contains('is-collapsed'));
         });
 
         panel.querySelector('#wjx-target-count').addEventListener('input', (event) => {
@@ -1204,6 +1604,41 @@
                 element.addEventListener('change', applyQuestionFilters);
             }
         });
+
+        // ===== 分页控件 =====
+        const pagerSize = panel.querySelector('#wjx-pager-size');
+        if (pagerSize) {
+            pagerSize.value = String(State.pager.pageSize);
+            pagerSize.addEventListener('change', (event) => {
+                setQuestionPageSize(event.target.value);
+            });
+        }
+        const pagerPrev = panel.querySelector('#wjx-pager-prev');
+        if (pagerPrev) {
+            pagerPrev.addEventListener('click', () => {
+                setQuestionPage(State.pager.page - 1);
+            });
+        }
+        const pagerNext = panel.querySelector('#wjx-pager-next');
+        if (pagerNext) {
+            pagerNext.addEventListener('click', () => {
+                setQuestionPage(State.pager.page + 1);
+            });
+        }
+        const pagerPageInput = panel.querySelector('#wjx-pager-page');
+        if (pagerPageInput) {
+            // 光标离开/回车时才跳转：边输入边跳会让「输入 12」在打完 1 时先跳到第 1 页。
+            pagerPageInput.addEventListener('change', (event) => {
+                setQuestionPage(event.target.value);
+            });
+            pagerPageInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    setQuestionPage(event.target.value);
+                    event.target.blur();
+                }
+            });
+        }
 
         panel.querySelector('#wjx-mode-ratio').addEventListener('click', () => {
             setDistributionMode('ratio');
@@ -1757,6 +2192,11 @@
                 ? '数量模式：各选项数值为该选项被选中的次数。无关联题目次数合计应等于设计份数；有关联题目次数合计应等于其父题对应选项的次数。'
                 : '比例模式：各选项数值为权重比例。';
         }
+        // 标题行右侧的一行摘要（设计稿里「比例模式：各选项数值为权重比例」那个位置）
+        const inlineHint = document.getElementById('wjx-mode-hint-inline');
+        if (inlineHint) {
+            inlineHint.textContent = mode === 'count' ? '各选项数值为选中次数' : '各选项数值为权重比例';
+        }
     }
 
     function getWeightInputSuffix(type) {
@@ -1771,7 +2211,12 @@
     }
 
     function distributeCountsEvenly(optionCount, total) {
-        const count = Math.max(1, optionCount || 1);
+        // 0 项时不能返回 [total]：那会给「不存在的第 1 个选项」分配全部次数，
+        // 后续按 index 取用时自然全部落空但权重看起来合法，掩盖了题目解析失败。
+        const count = Math.max(0, Math.floor(Number(optionCount) || 0));
+        if (count === 0) {
+            return [];
+        }
         const target = Math.max(0, Math.round(Number(total) || 0));
         const base = Math.floor(target / count);
         const remainder = target % count;
@@ -1800,12 +2245,19 @@
     // 比例模式：生成一组总和恒为 total（默认 100）的随机正整数份额，
     // 例如 4 选项 → 28/19/37/16（约等于 0.28/0.19/0.37/0.16）。
     // 每个选项都给一个非零权重，再按比例缩放到 total 并把取整误差补到最大项，保证和=total。
+    // 注意 total 可能小于选项数（如占比题 total=3 但有 5 行）：此时无法让每项都≥1，
+    // 必须允许出现 0，否则合计会超出 total 导致页面校验「各项之和必须等于 total」失败。
     function distributeRatiosToTotal(optionCount, total) {
         const count = Math.max(1, optionCount || 1);
-        const target = Math.max(count, Math.round(Number(total) || 0));
+        // 下限不再抬到 count：target 小于 count 时按实际 total 分配，允许 0
+        const target = Math.max(0, Math.round(Number(total) || 0));
+        if (target <= 0) {
+            return Array.from({ length: count }, () => 0);
+        }
         const raw = Array.from({ length: count }, () => Math.random() + 0.05);
         const sum = raw.reduce((acc, value) => acc + value, 0);
-        const scaled = raw.map((value) => Math.max(1, Math.round((value / sum) * target)));
+        // 下限从 1 改为 0：target < count 时必须允许 0 份额
+        const scaled = raw.map((value) => Math.max(0, Math.round((value / sum) * target)));
         let diff = scaled.reduce((acc, value) => acc + value, 0) - target;
         while (diff !== 0) {
             // 找当前最大/最小项把误差补回去，维持相对比例
@@ -1816,8 +2268,8 @@
                 }
             }
             const step = diff > 0 ? -1 : 1;
-            if (scaled[extremumIndex] + step < 1) {
-                // 不允许把某项扣到 0，放弃本轮微调（剩余误差极小，可忽略）
+            if (scaled[extremumIndex] + step < 0) {
+                // 不允许扣成负数；找不到可调整项时停止（理论上不会发生）
                 break;
             }
             scaled[extremumIndex] += step;
@@ -1933,29 +2385,6 @@
             const value = Number(input.value);
             return Number.isFinite(value) && value >= 0 ? Math.round(value) : 0;
         });
-    }
-
-    function sortCardsParentsFirst(cards) {
-        const relationDepth = (card, stack) => {
-            const visited = stack || new Set();
-            if (visited.has(card)) {
-                return 0;
-            }
-            visited.add(card);
-            const question = findQuestionByCard(card);
-            if (!question || !Array.isArray(question.relations) || !question.relations.length) {
-                return 0;
-            }
-            let depth = 0;
-            question.relations.forEach((relation) => {
-                const parentCard = cards.find((item) => String(item.dataset.qid) === String(relation.topicId));
-                if (parentCard) {
-                    depth = Math.max(depth, relationDepth(parentCard, visited) + 1);
-                }
-            });
-            return depth;
-        };
-        return cards.slice().sort((left, right) => relationDepth(left) - relationDepth(right));
     }
 
     // 建议单次不超过 100 份：问卷星与阿里云验证码会按设备/IP 做提交频率风控，
@@ -2295,6 +2724,71 @@
         document.getElementById('wjx-stat-types').textContent = String(new Set(State.config.questions.map((item) => item.type)).size);
     }
 
+    // 取当前筛选条件下命中的题目下标（按 State.config.questions 的顺序）。
+    // 分页必须建立在「筛选后的集合」之上，否则翻到第 2 页再搜索会出现
+    // 「显示第 2 页但只剩 1 条」这类页码与内容对不上的情况。
+    function getQuestionMatchState() {
+        const search = cleanText(document.getElementById('wjx-question-search') && document.getElementById('wjx-question-search').value).toLowerCase();
+        const type = String(document.getElementById('wjx-question-type-filter') && document.getElementById('wjx-question-type-filter').value || 'all');
+        return State.config.questions.map((question, index) => ({
+            index,
+            matches: matchesQuestionFilter(question, type, search)
+        }));
+    }
+
+    function matchesQuestionFilter(question, type, search) {
+        let matchesType;
+        if (type === 'all') {
+            matchesType = true;
+        } else if (type.startsWith('text-')) {
+            // 填空题细分筛选项：text-phone / text-number / text-idcard / text-email
+            matchesType = question.type === 'text' && (question.textRequirement || 'text') === type.slice('text-'.length);
+        } else {
+            matchesType = question.type === type;
+        }
+        if (!matchesType) {
+            return false;
+        }
+        if (!search) {
+            return true;
+        }
+        // 搜索范围与旧行为保持一致：标题、编号、题型标签、卡片元信息都可命中。
+        const haystack = cleanText([
+            question.title || '',
+            `Q${question.order}.`,
+            String(question.order),
+            getQuestionTypeLabel(question),
+            buildQuestionMeta(question)
+        ].join(' ')).toLowerCase();
+        return haystack.includes(search);
+    }
+
+    // 分页窗口计算：把「命中集合」按 pageSize 切片，并夹紧当前页，
+    // 保证删除/重扫导致总数变化后页码不会停在越界位置。
+    function getPagerView() {
+        const matches = getQuestionMatchState();
+        const matched = matches.filter((item) => item.matches);
+        const pageSize = PAGER_PAGE_SIZES.includes(State.pager.pageSize)
+            ? State.pager.pageSize
+            : PAGER_DEFAULT_PAGE_SIZE;
+        const totalPages = Math.max(1, Math.ceil(matched.length / pageSize));
+        const page = Math.min(Math.max(1, Number(State.pager.page) || 1), totalPages);
+        State.pager.page = page;
+        State.pager.pageSize = pageSize;
+        const start = (page - 1) * pageSize;
+        return {
+            matchedCount: matched.length,
+            totalCount: State.config.questions.length,
+            page,
+            pageSize,
+            totalPages,
+            // 本页要渲染的题目下标
+            visibleIndexes: matched.slice(start, start + pageSize).map((item) => item.index),
+            start: matched.length ? start + 1 : 0,
+            end: Math.min(start + pageSize, matched.length)
+        };
+    }
+
     function renderQuestionList() {
         const container = document.getElementById('wjx-question-list');
         if (!container) {
@@ -2305,11 +2799,118 @@
             container.innerHTML = `
                 <div class="wjx-empty">未识别到题目</div>
             `;
+            updatePagerUI({ matchedCount: 0, totalCount: 0, page: 1, pageSize: State.pager.pageSize, totalPages: 1, start: 0, end: 0 });
             return;
         }
 
-        container.innerHTML = State.config.questions.map((question) => renderQuestionCard(question)).join('');
-        applyQuestionFilters();
+        const view = getPagerView();
+
+        if (!view.matchedCount) {
+            container.innerHTML = `
+                <div class="wjx-empty">没有符合当前筛选条件的题目<br />请调整搜索关键词或题型筛选</div>
+            `;
+            updatePagerUI(view);
+            return;
+        }
+
+        // 只渲染当前页：题目多时不再一次性生成上百张卡片。
+        // 未渲染页的配置不会丢——collectCurrentQuestionsFromDom 以模型为准（见该函数）。
+        container.innerHTML = view.visibleIndexes
+            .map((index) => renderQuestionCard(State.config.questions[index]))
+            .join('');
+        // 渲染后把滚动位置复位到顶部，否则从第 5 页翻到第 6 页会停在中间。
+        container.scrollTop = 0;
+        updatePagerUI(view);
+    }
+
+    function updatePagerUI(view) {
+        const pager = document.getElementById('wjx-question-pager');
+        const info = document.getElementById('wjx-pager-info');
+        const pageInput = document.getElementById('wjx-pager-page');
+        const totalPagesEl = document.getElementById('wjx-pager-total-pages');
+        const sizeSelect = document.getElementById('wjx-pager-size');
+        const prevBtn = document.getElementById('wjx-pager-prev');
+        const nextBtn = document.getElementById('wjx-pager-next');
+        const summary = document.getElementById('wjx-match-summary');
+        const filtersActive = isQuestionFilterActive();
+
+        if (summary) {
+            summary.textContent = view.matchedCount === view.totalCount
+                ? `${view.totalCount} 道`
+                : `已匹配 ${view.matchedCount} / ${view.totalCount} 道`;
+        }
+
+        if (!pager) {
+            return;
+        }
+        // 只有真正需要分页（或筛选生效）时才显示控件，避免无谓占用面板高度。
+        pager.hidden = view.totalCount <= view.pageSize && !filtersActive;
+
+        if (info) {
+            info.textContent = view.matchedCount
+                ? `第 ${view.start}-${view.end} 题 / 共 ${view.matchedCount} 题`
+                : '无匹配题目';
+        }
+        if (pageInput) {
+            pageInput.value = String(view.page);
+            pageInput.max = String(view.totalPages);
+            // 只有一页时页码输入没有意义，置为只读外观但仍保留焦点能力
+            pageInput.disabled = view.totalPages <= 1;
+        }
+        if (totalPagesEl) {
+            totalPagesEl.textContent = String(view.totalPages);
+        }
+        if (sizeSelect && String(sizeSelect.value) !== String(view.pageSize)) {
+            sizeSelect.value = String(view.pageSize);
+        }
+        if (prevBtn) {
+            prevBtn.disabled = view.page <= 1;
+        }
+        if (nextBtn) {
+            nextBtn.disabled = view.page >= view.totalPages;
+        }
+    }
+
+    function isQuestionFilterActive() {
+        const search = cleanText(document.getElementById('wjx-question-search') && document.getElementById('wjx-question-search').value);
+        const type = String(document.getElementById('wjx-question-type-filter') && document.getElementById('wjx-question-type-filter').value || 'all');
+        return !!search || type !== 'all';
+    }
+
+    function setQuestionPage(page) {
+        const view = getPagerView();
+        const next = Math.min(Math.max(1, Math.round(Number(page) || 1)), view.totalPages);
+        if (next === view.page) {
+            // 页码没变也要把输入框纠正回合法值（用户可能输入了 999 或空值）
+            const pageInput = document.getElementById('wjx-pager-page');
+            if (pageInput) {
+                pageInput.value = String(view.page);
+            }
+            return;
+        }
+        State.pager.page = next;
+        renderQuestionList();
+    }
+
+    function setQuestionPageSize(size) {
+        const next = Number(size);
+        if (!PAGER_PAGE_SIZES.includes(next) || next === State.pager.pageSize) {
+            return;
+        }
+        // 换每页条数时尽量保持当前浏览位置：按「当前页第一条题目」换算成新页码，
+        // 否则用户从 10/页 切到 50/页 会被直接弹回第 1 页。
+        const view = getPagerView();
+        const anchorIndex = view.visibleIndexes.length ? view.visibleIndexes[0] : 0;
+        State.pager.pageSize = next;
+        State.pager.page = Math.floor(anchorIndex / next) + 1;
+        renderQuestionList();
+    }
+
+    function applyQuestionFilters() {
+        // 筛选条件一变，命中集合就变了，页码必须回到第 1 页，
+        // 否则会出现「第 3 页 / 共 1 页」这种越界状态。
+        State.pager.page = 1;
+        renderQuestionList();
     }
 
     function renderQuestionCard(question) {
@@ -2435,25 +3036,6 @@
                 ${tools}
             </article>
         `;
-    }
-
-    function applyQuestionFilters() {
-        const search = cleanText(document.getElementById('wjx-question-search') && document.getElementById('wjx-question-search').value).toLowerCase();
-        const type = String(document.getElementById('wjx-question-type-filter') && document.getElementById('wjx-question-type-filter').value || 'all');
-        document.querySelectorAll(`#${PANEL_ID} .wjx-card`).forEach((card) => {
-            let matchesType;
-            if (type === 'all') {
-                matchesType = true;
-            } else if (type.startsWith('text-')) {
-                // 填空题细分筛选项：text-phone / text-number / text-idcard / text-email
-                matchesType = card.dataset.type === 'text' &&
-                    card.dataset.requirement === type.slice('text-'.length);
-            } else {
-                matchesType = card.dataset.type === type;
-            }
-            const matchesSearch = !search || cleanText(card.textContent).toLowerCase().includes(search);
-            card.classList.toggle('is-filtered', !matchesType || !matchesSearch);
-        });
     }
 
     function updateWeightVisuals(card) {
@@ -2645,16 +3227,25 @@
         return Math.max(1, Number(input && input.value) || 1);
     }
 
+    // 把面板上的编辑状态同步回 State.config.questions。
+    // 关键前提：题目列表现在分页渲染，DOM 里只有当前页的卡片。
+    // 旧实现「以 DOM 卡片为准重建整个数组」在分页后会把它页题目全部丢掉，
+    // 进而让 syncStateFromDom → saveConfig 把未渲染页的配置从 localStorage 抹掉。
+    // 因此这里改成模型驱动：以 State.config.questions 为骨架，
+    // 只对「当前 DOM 里存在卡片」的题目覆盖其用户可编辑字段。
     function collectCurrentQuestionsFromDom() {
-        return Array.from(document.querySelectorAll(`#${PANEL_ID} .wjx-card`)).map((card, index) => {
-            const id = card.dataset.qid;
-            const type = card.dataset.type;
-            const original = State.config.questions.find((item) => String(item.id) === String(id) && item.type === type) || {};
+        const cardsByKey = new Map();
+        document.querySelectorAll(`#${PANEL_ID} .wjx-card`).forEach((card) => {
+            cardsByKey.set(`${card.dataset.qid}__${card.dataset.type}`, card);
+        });
+
+        return State.config.questions.map((question, index) => {
+            const original = question || {};
             const next = {
-                id,
+                id: original.id,
                 order: original.order || index + 1,
                 title: original.title || '',
-                type,
+                type: original.type,
                 optionLabels: Array.isArray(original.optionLabels) ? original.optionLabels.slice() : [],
                 relations: Array.isArray(original.relations) ? original.relations.map((relation) => Object.assign({}, relation)) : [],
                 rowCount: original.rowCount || 0,
@@ -2672,6 +3263,21 @@
                     ? original.optionFills.map((fill) => Object.assign({ enabled: false, value: '' }, fill))
                     : []
             };
+            if (Array.isArray(original.weights)) {
+                next.weights = original.weights.slice();
+            }
+            if (Array.isArray(original.content)) {
+                next.content = original.content.slice();
+            }
+
+            const card = cardsByKey.get(`${original.id}__${original.type}`);
+            if (!card) {
+                // 该题不在当前页：模型里的值就是权威值，原样返回。
+                // 这样翻页、搜索、切换每页条数都不会影响未渲染题目的配置。
+                return next;
+            }
+
+            const type = card.dataset.type;
 
             // 选项内嵌填空：以面板当前输入框的值为准（用户可能刚改过）。
             const fillInputs = Array.from(card.querySelectorAll('[data-role="option-fill"]'));
@@ -2700,7 +3306,7 @@
                 const area = card.querySelector('[data-role="content-editor"]');
                 next.content = area
                     ? area.value.split('\n').map((line) => line.trim()).filter(Boolean)
-                    : DEFAULT_TEXT_LIBRARY.slice();
+                    : (Array.isArray(original.content) ? original.content.slice() : DEFAULT_TEXT_LIBRARY.slice());
             } else if (type === 'slide') {
                 next.minScore = clampScore(card.querySelector('[data-role="slide-min"]') && card.querySelector('[data-role="slide-min"]').value, original.minScore || 1);
                 next.maxScore = clampScore(card.querySelector('[data-role="slide-max"]') && card.querySelector('[data-role="slide-max"]').value, original.maxScore || 100);
@@ -2799,61 +3405,162 @@
         showToast(isCountMode() ? '已按关联次数均衡分配。' : '已生成随机比例。');
     }
 
+    // 按关联深度排序（父题在前）。
+    // 数量模式下子题的「应填次数」由父题各选项次数推导，父题必须先随机出结果，
+    // 否则子题会按父题的旧值计算，出现「子题合计≠父题可见份数」的校验失败。
+    function sortQuestionsParentsFirst(questions) {
+        const byId = new Map(questions.map((question) => [String(question.id), question]));
+        const depthOf = (question, stack) => {
+            const visited = stack || new Set();
+            const key = String(question.id);
+            if (visited.has(key)) {
+                return 0;
+            }
+            visited.add(key);
+            if (!Array.isArray(question.relations) || !question.relations.length) {
+                return 0;
+            }
+            let depth = 0;
+            question.relations.forEach((relation) => {
+                const parent = byId.get(String(relation.topicId));
+                if (parent) {
+                    depth = Math.max(depth, depthOf(parent, visited) + 1);
+                }
+            });
+            return depth;
+        };
+        return questions
+            .map((question, index) => ({ question, index, depth: depthOf(question) }))
+            .sort((left, right) => (left.depth - right.depth) || (left.index - right.index))
+            .map((item) => item.question);
+    }
+
+    // 一键随机全部：必须作用于整个配置，而不是「当前页已渲染的卡片」。
+    // 分页后 DOM 里只有一页卡片，旧实现只遍历卡片，翻到第 1 页点「一键随机全部」
+    // 会把第 2 页之后的题目全部跳过（而且用户看不出没随机，只会在提交时发现
+    // 那些题还是旧值）。现在以模型为准，同时把结果回写到已渲染的卡片上。
     function randomizeAllQuestions(options) {
         const settings = Object.assign({ silent: false }, options);
+        // 先把用户在当前页的编辑收进模型，避免随机过程中被覆盖。
         syncStateFromDom();
-        const cards = sortCardsParentsFirst(Array.from(document.querySelectorAll(`#${PANEL_ID} .wjx-card`)));
-        cards.forEach((card) => {
-            const type = card.dataset.type;
+
+        const ordered = sortQuestionsParentsFirst(State.config.questions);
+        ordered.forEach((question) => {
+            if (!question) {
+                return;
+            }
+            const card = findCardForQuestion(question);
+            const type = question.type;
+
             if (type === 'text') {
-                const area = card.querySelector('[data-role="content-editor"]');
+                question.content = DEFAULT_TEXT_LIBRARY.slice();
+                const area = card && card.querySelector('[data-role="content-editor"]');
                 if (area) {
-                    area.value = DEFAULT_TEXT_LIBRARY.join('\n');
+                    area.value = question.content.join('\n');
                 }
                 return;
             }
             if (type === 'slide') {
-                const minInput = card.querySelector('[data-role="slide-min"]');
-                const maxInput = card.querySelector('[data-role="slide-max"]');
-                if (minInput && maxInput) {
-                    const minScore = randomInt(20, 70);
-                    const maxScore = randomInt(minScore, Math.min(100, minScore + 30));
-                    minInput.value = String(minScore);
-                    maxInput.value = String(maxScore);
+                const minScore = randomInt(20, 70);
+                const maxScore = randomInt(minScore, Math.min(100, minScore + 30));
+                question.minScore = minScore;
+                question.maxScore = maxScore;
+                if (card) {
+                    const minInput = card.querySelector('[data-role="slide-min"]');
+                    const maxInput = card.querySelector('[data-role="slide-max"]');
+                    if (minInput) {
+                        minInput.value = String(minScore);
+                    }
+                    if (maxInput) {
+                        maxInput.value = String(maxScore);
+                    }
                 }
                 return;
             }
             if (type === 'gapfill') {
                 // 填空组按各格含义重新随机（年/月/日各自合法范围），避免多份提交值完全相同。
-                const gapQuestion = findQuestionByCard(card) || {};
-                card.querySelectorAll('[data-role="gap-value"]').forEach((input) => {
-                    const index = Number(input.dataset.index);
-                    input.value = suggestGapfillValue(Array.isArray(gapQuestion.gapLabels) ? gapQuestion.gapLabels[index] : '');
-                });
+                const labels = Array.isArray(question.gapLabels) ? question.gapLabels : [];
+                const count = Math.max(labels.length, Array.isArray(question.gapValues) ? question.gapValues.length : 0);
+                question.gapValues = Array.from({ length: count }, (value, index) => suggestGapfillValue(labels[index]));
+                if (card) {
+                    card.querySelectorAll('[data-role="gap-value"]').forEach((input) => {
+                        const index = Number(input.dataset.index);
+                        if (Number.isInteger(index) && index >= 0 && index < question.gapValues.length) {
+                            input.value = question.gapValues[index];
+                        }
+                    });
+                }
                 return;
             }
             if (type === 'unknown' || type === 'location' || type === 'sorting') {
                 return;
             }
+
             // 复合题的内嵌填空值一并随机，避免多份提交里永远是同一个数字。
-            card.querySelectorAll('[data-role="option-fill"]').forEach((input) => {
-                const labels = (findQuestionByCard(card) || {}).optionLabels;
-                const index = Number(input.dataset.index);
-                const optionLabel = Array.isArray(labels) && Number.isInteger(index) ? String(labels[index] || '') : '';
-                input.value = suggestInlineValueByLabel(optionLabel);
-            });
-            const original = findQuestionByCard(card) || { relations: [] };
-            const values = buildRandomWeightValues(getQuestionWeightInputCount(card, original), original);            card.querySelectorAll('[data-role="weight-input"]').forEach((input, index) => {
-                input.value = String(values[index] || 0);
-            });
-            syncQuestionWeightsFromCard(card);
+            const labels = Array.isArray(question.optionLabels) ? question.optionLabels : [];
+            if (Array.isArray(question.optionFills) && question.optionFills.length) {
+                question.optionFills = question.optionFills.map((fill, index) => {
+                    if (!fill || fill.enabled === false) {
+                        return fill;
+                    }
+                    return Object.assign({}, fill, {
+                        value: suggestInlineValueByLabel(String(labels[index] || ''))
+                    });
+                });
+            }
+            if (card) {
+                card.querySelectorAll('[data-role="option-fill"]').forEach((input) => {
+                    const index = Number(input.dataset.index);
+                    const fill = Array.isArray(question.optionFills) && Number.isInteger(index)
+                        ? question.optionFills[index]
+                        : null;
+                    if (fill && typeof fill.value === 'string') {
+                        input.value = fill.value;
+                    }
+                });
+            }
+
+            const optionCount = Math.max(
+                labels.length,
+                Array.isArray(question.weights) ? question.weights.length : 0,
+                1
+            );
+            const values = buildRandomWeightValues(optionCount, question);
+            question.weights = values.slice();
+            if (card) {
+                card.querySelectorAll('[data-role="weight-input"]').forEach((input, index) => {
+                    input.value = String(values[index] || 0);
+                });
+            }
         });
+
+        // 模型已是权威值；这里再同步一次，让「已渲染卡片」与模型严格一致。
+        // 不调 renderQuestionList：整表重绘会把用户当前页码的滚动位置顶回顶部，
+        // 而当前页各输入框的值在上面的循环里已经就地写好了。
         syncStateFromDom();
         saveConfig();
+        document.querySelectorAll(`#${PANEL_ID} .wjx-card`).forEach((card) => {
+            updateWeightVisuals(card);
+        });
         updateCountModeHints();
         if (!settings.silent) {
             showToast(isCountMode() ? '已按各题关联次数均衡分配。' : '已随机全部题目。');
         }
+    }
+
+    // 按题号 + 题型找当前页面上的卡片（分页后可能不存在）。
+    function findCardForQuestion(question) {
+        if (!question) {
+            return null;
+        }
+        const qid = String(question.id).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        const cards = document.querySelectorAll(`#${PANEL_ID} .wjx-card[data-qid="${qid}"]`);
+        for (const card of cards) {
+            if (card.dataset.type === question.type) {
+                return card;
+            }
+        }
+        return null;
     }
 
     function scanQuestions() {
@@ -3026,7 +3733,6 @@
             maxScore: 100,
             // 选项内嵌填空（复合题）与填空题的校验类型，非对应题型时保持空值。
             optionFills: [],
-            optionTexts: {},
             textRequirement: 'text'
         };
 
@@ -3752,15 +4458,7 @@
         } catch (error) {
             logWarning('恢复面板折叠状态失败', error);
         }
-        const body = panel.querySelector('#wjx-panel-body');
-        const button = panel.querySelector('#wjx-toggle-panel');
-        panel.classList.toggle('is-collapsed', collapsed);
-        if (body) {
-            body.classList.toggle('wjx-hidden', collapsed);
-        }
-        if (button) {
-            button.textContent = collapsed ? '展开' : '收起';
-        }
+        setPanelCollapsed(panel, collapsed);
     }
 
     function clearAutomationStorage() {
@@ -4778,19 +5476,24 @@
         return min + Math.floor(Math.random() * (max - min + 1));
     }
 
-    function isNodeVisible(node) {
-        if (!(node instanceof HTMLElement)) {
+    // 元素是否可见。判据：未被 hidden 属性隐藏、计算样式非 none/hidden/透明、且有实际布局盒。
+    // 这是全脚本唯一的可见性判定实现（此前 isNodeVisible / isElementVisible 两份完全相同的副本）。
+    function isElementVisible(element) {
+        if (!(element instanceof HTMLElement)) {
             return false;
         }
-        if (node.hasAttribute('hidden')) {
+        if (element.hasAttribute('hidden')) {
             return false;
         }
-        const style = window.getComputedStyle(node);
+        const style = window.getComputedStyle(element);
         if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
             return false;
         }
-        return node.getClientRects().length > 0;
+        return element.getClientRects().length > 0;
     }
+
+    // 别名：历史调用点统一用 isNodeVisible，保留以维持既有可读性。
+    const isNodeVisible = isElementVisible;
 
     function getVisibleQuestionNodes() {
         return findQuestionNodes().filter(isNodeVisible);
@@ -5154,7 +5857,14 @@
         // 点击选项后由页面脚本把 .ui-text 显示出来，输入框才是可写状态。
         // 旧逻辑写死 '其他' 且不看题目是否要求，等于把所有复合题都填成「其他」。
         if (optionFill && optionFill.enabled !== false) {
-            fillInlineOptionInput(option, optionFill.value);
+            // 内嵌框写不进去时不能静默：该选项会被问卷星判成「未作答」，
+            // 整个批次卡在这一题上，而面板看起来一切正常。
+            if (!fillInlineOptionInput(option, optionFill.value)) {
+                logWarning('选项内嵌填空写入失败', {
+                    option: (option.textContent || '').trim().slice(0, 40),
+                    value: optionFill.value
+                });
+            }
         }
         return isChoiceSelected(option, type);
     }
@@ -5179,15 +5889,12 @@
             wrapper.style.display = 'block';
         }
 
-        input.value = text;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        // 部分问卷星版本给内嵌框绑了 blur 校验，补一次以获得「已作答」状态。
-        if (typeof input.blur === 'function') {
-            try {
-                input.dispatchEvent(new Event('blur', { bubbles: false }));
-            } catch (error) {}
-        }
+        // 问卷星给内嵌填空绑的是 "blur keyup"（见 jqmobo2.js：
+        // $("input.OtherRadioText",l).bind("blur keyup", e => otherTextEvent(this,l);
+        // "blur"==e.type && saveAnswer(...))）；keyup 触发 otherTextEvent 把值同步进
+        // 选项对象，blur 才真正走 saveAnswer。只派发 input/change 会得到
+        // 「输入框有字、答案表里没有」的假填写，提交时仍被判未作答。
+        writeTextInput(input, text);
         return input.value === text;
     }
 
@@ -5244,7 +5951,12 @@
             }
             // 若选项带内嵌填空但首次点击后输入框才显示，这里再补一次写入。
             if (optionFill && optionFill.enabled !== false && !readInlineOptionInput(option)) {
-                fillInlineOptionInput(option, optionFill.value);
+                if (!fillInlineOptionInput(option, optionFill.value)) {
+                    logWarning('选项内嵌填空补写失败', {
+                        option: (option.textContent || '').trim().slice(0, 40),
+                        value: optionFill.value
+                    });
+                }
             }
             return selected || isChoiceSelected(option, type);
         }
@@ -5636,20 +6348,6 @@
             }
         });
         return attempted > 0 && succeeded === attempted;
-    }
-
-    function isElementVisible(element) {
-        if (!(element instanceof HTMLElement)) {
-            return false;
-        }
-        if (element.hasAttribute('hidden')) {
-            return false;
-        }
-        const style = window.getComputedStyle(element);
-        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
-            return false;
-        }
-        return element.getClientRects().length > 0;
     }
 
     async function waitForCondition(checker, timeoutMs, intervalMs) {
@@ -6130,7 +6828,11 @@
         let snapshot = null;
         try {
             snapshot = localStorage.getItem(QUOTA_STATE_KEY);
-        } catch (error) {}
+        } catch (error) {
+            // 读不到快照就无法保证能回滚。此时若静默继续，下一次「配额不足」
+            // 会把本次尝试的消耗算进总数，用户看到份数凭空减少却查不到原因。
+            logWarning('读取配额快照失败，本次不做回滚', error);
+        }
         try {
             return await callback();
         } finally {
@@ -6140,7 +6842,9 @@
                 } else {
                     localStorage.setItem(QUOTA_STATE_KEY, snapshot);
                 }
-            } catch (error) {}
+            } catch (error) {
+                logWarning('恢复配额快照失败', error);
+            }
         }
     }
 
