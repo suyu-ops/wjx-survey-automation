@@ -76,7 +76,8 @@ load('cleanText', 'clampScore', 'escapeHtml', 'trimOptionPrefix', 'dedupeTexts',
   'generateValueForRequirement', 'suggestGapfillValue', 'randomInt',
   'pickWeightedIndex', 'pickMultipleIndices', 'distributeRatiosToTotal',
   'distributeCountsEvenly', 'fisherYatesShuffle', 'parseRelations',
-  'normalizeDistributionMode', 'getQuestionTypeLabel', 'formatRequirementHint');
+  'normalizeDistributionMode', 'getQuestionTypeLabel', 'formatRequirementHint',
+  'readNumericBound', 'getMatrixRowIndexBase', 'getMatrixQuotaRowIndex');
 
 // 需要别名的
 globalThis.isElementVisible = () => true;
@@ -214,6 +215,98 @@ eq(getQuestionTypeLabel({ type: 'text', textRequirement: 'text' }), '填空题',
 eq(getQuestionTypeLabel({ type: 'gapfill' }), '填空组', 'gapfill 标签');
 eq(getQuestionTypeLabel({ type: 'unknown' }), '未知题型', 'unknown 标签');
 eq(getQuestionTypeLabel(null), '未知题型', 'null 不崩');
+
+// ===== 以下为回归测试：每一项都对应一个已修复的真实缺陷 =====
+
+console.log('\n===== 12. 数字题范围（minword/maxword） =====');
+{
+  // 真实题：verify='数字' minword='0' maxword='10'。
+  // 旧实现只读 input.min / input.max，取不到就退化成 0~99999，几乎必定越界。
+  const input = {
+    getAttribute: (name) => {
+      const attrs = { minword: '0', maxword: '10' };
+      return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+    }
+  };
+  let inRange = true, seenMax = false;
+  for (let i = 0; i < 500; i++) {
+    const v = Number(generateValueForRequirement('number', input));
+    if (!(v >= 0 && v <= 10)) { inRange = false; break; }
+    if (v === 10) seenMax = true;
+  }
+  ok(inRange, 'minword/maxword 约束下 500 次生成全部落在 [0,10]');
+  ok(seenMax, '上界 10 可达（不是永远取不到边界）');
+  eq(readNumericBound(input, ['maxword', 'max'], NaN), 10, 'readNumericBound 优先 maxword');
+  eq(readNumericBound({ getAttribute: () => null }, ['maxword', 'max'], 7), 7, 'readNumericBound 全缺失时回退');
+  // 标准 min/max 仍作为兜底
+  const stdInput = {
+    getAttribute: (name) => (name === 'max' ? '5' : name === 'min' ? '2' : null)
+  };
+  let stdOk = true;
+  for (let i = 0; i < 300; i++) {
+    const v = Number(generateValueForRequirement('number', stdInput));
+    if (!(v >= 2 && v <= 5)) { stdOk = false; break; }
+  }
+  ok(stdOk, '无 minword/maxword 时用 min/max 兜底');
+  // 边界写反不能产生非法区间
+  const reversed = {
+    getAttribute: (name) => (name === 'minword' ? '9' : name === 'maxword' ? '3' : null)
+  };
+  const rv = Number(generateValueForRequirement('number', reversed));
+  ok(Number.isFinite(rv) && rv >= 3, 'min>max 时以 min 为准，不产生非法值', rv);
+}
+
+console.log('\n===== 13. 多选零权重 =====');
+{
+  // 旧实现 Math.max(1, w) 把 0 抬成 1，于是 [0,0,0,100] 选 1 项时
+  // 零权重项也有 3/103 ≈ 3% 的概率被选中，用户配的 0 等于失效。
+  let leaked = 0;
+  for (let i = 0; i < 2000; i++) {
+    const r = pickMultipleIndices([0, 0, 0, 100], 1, 1);
+    if (r.length !== 1 || r[0] !== 3) leaked++;
+  }
+  eq(leaked, 0, '选 1 项时永远选唯一正权重项');
+  // 多项时正权重项必须始终在内（不因零权重干扰而落空）
+  let alwaysHasPositive = true;
+  for (let i = 0; i < 500; i++) {
+    const r = pickMultipleIndices([0, 0, 0, 100], 2, 2);
+    if (!r.includes(3)) { alwaysHasPositive = false; break; }
+  }
+  ok(alwaysHasPositive, '选 2 项时正权重项始终在内');
+  // 只有一项正权重但要求选 2 项：必须回落到零权重项补齐，且不重复
+  let fillOk = true;
+  for (let i = 0; i < 200; i++) {
+    const r = pickMultipleIndices([0, 0, 0, 100], 2, 2);
+    if (r.length !== 2 || new Set(r).size !== 2) { fillOk = false; break; }
+  }
+  ok(fillOk, '正权重不足时用零权重项补齐，数量仍精确且不重复');
+  // 全零权重退化为均等随机，不应崩
+  let allZeroOk = true;
+  for (let i = 0; i < 200; i++) {
+    const r = pickMultipleIndices([0, 0, 0, 0], 1, 2);
+    if (!r.length || r.some((idx) => idx < 0 || idx > 3)) { allZeroOk = false; break; }
+  }
+  ok(allZeroOk, '全零权重均等回退，不崩且索引合法');
+}
+
+console.log('\n===== 14. 矩阵配额行号 =====');
+{
+  const mkRow = (rowindex) => ({ getAttribute: (name) => (name === 'rowindex' ? rowindex : null) });
+  // 真实存档（Qw71Alf / desktop_page / mobile_page）里 rowindex 都是 0 起。
+  // 旧实现做 parsed > 0 ? parsed - 1 : parsed，把 0..9 映射成 0,0,1,2,...,8，
+  // 导致第 1、2 行共用配额行 0，最后一行永远用不到自己的配额。
+  const zeroBased = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(mkRow);
+  eq(getMatrixRowIndexBase(zeroBased), 0, '0 起页面识别为 base=0');
+  const mapped0 = zeroBased.map((row, i) => getMatrixQuotaRowIndex(row, i, 0));
+  eq(mapped0, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], '0 起页面行号与原值一一对应');
+  // 若某版本是 1 起，按整题基准换算不应错位
+  const oneBased = [1, 2, 3].map(mkRow);
+  eq(getMatrixRowIndexBase(oneBased), 1, '1 起页面识别为 base=1');
+  eq(oneBased.map((row, i) => getMatrixQuotaRowIndex(row, i, 1)), [0, 1, 2], '1 起页面换算为 0 起配额行');
+  // 缺 rowindex 时用 DOM 序号兜底
+  eq(getMatrixQuotaRowIndex(mkRow(null), 4, 0), 4, '缺 rowindex 时回退 DOM 序号');
+  eq(getMatrixRowIndexBase([]), 0, '无数据行时 base 为 0，不崩');
+}
 
 console.log(`\n===== ${pass} passed, ${fail} failed =====`);
 if (fail) {

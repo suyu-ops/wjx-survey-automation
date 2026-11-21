@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         问卷星答题配置助手（增强版）
 // @namespace    https://wjx.panel.local
-// @version      2.0.0
+// @version      2.0.1
 // @description  问卷星填写辅助工具：识别常见题型，按比例或次数配置选项，支持评分星级、关联题、多页填写、预览、配置导入导出和失败恢复。自动批量提交可能触发网站风控，请仅在获得授权的问卷中使用。
+// @updateLog 2.0.1 - 只修行为正确性，不加功能：7 处「代码看着对、跑起来是错的」缺陷，每一条都先在真实存档上复现、修完再补回归测试（断言 161 → 186）。① 设计份数刷新后被覆盖：refreshQuestions 无条件用 getCurrentTargetCount() 读 DOM，初始化时输入框还是模板默认 value="1"，存了 50 份、刷新后面板显示 1，此后任何保存都会把 1 永久写回；现在只在 preserveInputs 为真（用户确实在操作面板）时才采信 DOM，并先把权威份数写回输入框再算「数量模式」提示。② 清除本地数据后配置被写回：清除流程调 refreshQuestions({preserveInputs:false})，此时存档已删 → shouldAutoRandomize 判定无配置 → 自动随机 → saveConfig，用户看到「已清除」但 localStorage 里还有；现在刷新界面后再删一次，清除的语义回到「未配置状态」。③ 矩阵配额行号整体错位：真实存档（Qw71Alf / desktop_page / mobile_page）里 rowindex 是 0 起，旧实现做 parsed > 0 ? parsed - 1 : parsed，把 0..9 映射成 0,0,1,…,8，第 1、2 行共用配额行、最后一行永远用不到自己的配额；现在按整题最小 rowindex 判断基准（0 起或 1 起），两种页面都不错位。④ 数字题越界：问卷星把取值范围写在 minword/maxword（真实题 verify='数字' minword='0' maxword='10'），旧实现只读标准 min/max，取不到就退化成 0～99999；现在按 minword/maxword 优先、min/max 兜底，min>max 时以 min 为准。⑤ 零权重选项仍被选中：pickMultipleIndices 里 Math.max(1, Number(weight) || 1) 把用户写的 0 抬成 1，[0,0,0,100] 选 2 项时 500 次全都把零权重项选了进来；现在 0 就是 0，优先从正权重抽，正权重不足以凑够最少选择数时才回落到零权重项。⑥ 完成页进度弹窗无样式：.wjx-progress-modal 定义在 STYLE_TEXT 里，但完成页走 handleCompletion 分支时 injectStyles() 还没执行，弹窗实测 position: static、背景透明；现在把样式注入提到完成页判定之前，并给 injectStyles 加幂等保护。⑦ 无 id/topic 的题永远填不上：扫描时用序号兜底（fallback:1）、填写与翻页签名用 fallback:temp，两处永不相等 → 这类题被静默跳过，多道这样的题还会把页面签名压成同一个值；现在兜底统一取题目在页面中的稳定序号，与扫描的 index+1 对齐。
 // @updateLog 2.0.0 - 版本号里程碑：0.1.x 系列收束为 2.0.0，本版**不含功能改动**，内容与 0.1.20 完全一致。之所以一次性跨过 1.x：0.1.16-0.1.20 五个版本把「填写正确性」从事件契约层（keyup/blur/click 复刻、GB 11643 校验位、内嵌填空 otherTextEvent）到配置同步层（分页后模型驱动 collectCurrentQuestionsFromDom、randomizeAllQuestions 覆盖全页）都补齐了，配上 161 项自动化断言，才算第一份敢让人长期用的稳定版；0.1.x 的名字已不足以描述它。历史条目原样保留在下方，未做删改。
 // @updateLog 0.1.20 - 面板重做与题目分页：① 按设计稿重做面板视觉（纯 CSS 实现，不引入 Tailwind CDN，避免 @grant none 下的外部依赖与断网失效）：标题栏加品牌图标、统计卡改渐变、分配模式改分段控件、主 CTA 拆到常驻底部操作栏。② 面板改为纯固定定位（position: fixed，右上角），移除 0.1.1 引入的拖拽逻辑与 _PANEL_POSITION 位置记忆——可拖动在多页问卷里经常被误拖到屏幕外且无法找回。③ 题目列表改为「列表内独立滚动 + 分页控件」：默认 10 题/页，支持每页条数（10/20/50/200）、上一页/下一页、页码直接跳转，并与搜索/题型筛选联动（改筛选自动回第 1 页，标题旁显示「已匹配 x / y 道」，无匹配给出明确空态）。这解决了题目多时必须一直往下翻的问题：147 题时面板渲染从 55.6ms 降到 27.1ms、卡片数从 148 张恒定降到 10 张，且此时已快于上游原版（35.3ms）。④ 分页的关键安全改动：collectCurrentQuestionsFromDom 改为模型驱动——旧实现「以 DOM 卡片为准重建配置数组」，分页后 DOM 只有当前页卡片，任何 syncStateFromDom+saveConfig 都会把未渲染页的配置从 localStorage 静默抹掉；现在以 State.config.questions 为骨架，只覆盖当前 DOM 中存在的卡片的可编辑字段。⑤ 同源缺陷一并修复：randomizeAllQuestions 旧实现遍历 DOM 卡片，分页后「一键随机全部」只会随机当前页，其余题的旧值会一直带到提交；现在改为按模型遍历全部题目并顺带回写已渲染卡片，同时把父子排序从「按卡片排序」改为「按模型关联深度排序」（卡片排序在分页后找不到父题，数量模式下会让子题按父题旧值算次数）。
 // @updateLog 0.1.19 - 修复选项内嵌填空（复合题）写不进答案表：问卷星给 input.OtherText / input.OtherRadioText 绑定的是 "blur keyup"——keyup 走 otherTextEvent 把值同步进选项对象，blur 才调用 saveAnswer。此前这里只派发 input/change，界面看着填上了、答案表里却是空的，提交时该题仍被判「未作答」；现在统一走 writeTextInput（focus + input/change + keyup + blur），与填空题保持同一套事件序列。同时补上两处调用点的返回值检查：内嵌框写不进去时用 logWarning 报出来，不再静默当作成功。配额回滚 withQuotaRollback 的读取/恢复失败也从空 catch 改为 logWarning，避免份数凭空减少却查不到原因。清理从未被读写过的 optionTexts 字段（实际使用的是 optionFills）。
@@ -1204,6 +1205,12 @@
 
         State.surveyKey = createSurveyKey();
 
+        // 样式必须先注入，且要在「完成页分支」之前：
+        // 完成页（handleCompletion）也会用进度弹窗和 toast，而它们的外观全部定义在 STYLE_TEXT 里。
+        // 旧顺序是先判断完成页、直接 return，导致完成页上的进度弹窗只有 injectProgressStyles
+        // 补充的那条 .wjx-progress-status，容器本身没有 position/背景，变成一个贴在文档流里的透明块。
+        injectStyles();
+
         if (isCompletionPage()) {
             handleCompletion();
             return;
@@ -1213,7 +1220,6 @@
             return;
         }
 
-        injectStyles();
         renderPanel();
         refreshQuestions({ silent: true, preserveInputs: false });
         updateAllRelationVisibility();
@@ -1394,7 +1400,11 @@
     }
 
     function injectStyles() {
+        if (document.querySelector('style[data-wjx-panel]')) {
+            return;
+        }
         const style = document.createElement('style');
+        style.setAttribute('data-wjx-panel', '1');
         style.textContent = STYLE_TEXT;
         document.head.appendChild(style);
     }
@@ -1764,19 +1774,24 @@
     function refreshQuestions(options) {
         const settings = Object.assign({ silent: false, preserveInputs: true }, options);
         const previousQuestions = settings.preserveInputs ? collectCurrentQuestionsFromDom() : [];
-        const previousTargetCount = getCurrentTargetCount();
+        // 设计份数只在「采信面板现值」时才从 DOM 读。
+        // 初始化与清除本地数据时面板还是模板默认的 value="1"，
+        // 若照样读 DOM，就会把 localStorage 里存着的份数覆盖回 1。
+        const previousTargetCount = settings.preserveInputs ? getCurrentTargetCount() : null;
         const savedConfig = loadConfig();
         const scannedQuestions = scanQuestions();
 
         State.config = mergeConfig(savedConfig, previousQuestions, previousTargetCount, scannedQuestions);
-        renderStats();
-        renderQuestionList();
-        updateCountModeHints();
-
+        // 先把手里的权威份数写回输入框，再算「数量模式提示」。
+        // updateCountModeHints 里的提示文字要走 getCurrentTargetCount() 读 DOM，
+        // 若此时输入框还是模板默认的 value="1"，提示会按 1 份算出来（与存档不一致）。
         const targetInput = document.getElementById('wjx-target-count');
         if (targetInput) {
             targetInput.value = String(State.config.targetCount);
         }
+        renderStats();
+        renderQuestionList();
+        updateCountModeHints();
         updateTargetCountHint();
         const speedInput = document.getElementById('wjx-speed-profile');
         if (speedInput) {
@@ -2412,7 +2427,9 @@
         if (!isCountMode()) {
             return;
         }
-        State.config.targetCount = getCurrentTargetCount();
+        // 不要在这里从 DOM 读份数：本函数在 refreshQuestions 里先于「把存档份数写回输入框」执行，
+        // 面板刚渲染时输入框还是模板默认的 value="1"，一旦回写就会把存档里的份数打回 1。
+        // 份数以 State.config.targetCount 为权威值，DOM 变更只由输入框自身的 input 事件写入。
         document.querySelectorAll(`#${PANEL_ID} [data-role="count-expected-hint"]`).forEach((element) => {
             const question = findQuestionByCard(element.closest('.wjx-card'));
             if (!question) {
@@ -3172,6 +3189,14 @@
         clearAutomationStoppedFlag();
         const deviceState = clearSurveyDeviceState();
         refreshQuestions({ silent: true, preserveInputs: false });
+        // refreshQuestions 在「没有已有配置」时会自动随机出一套默认值并 saveConfig()，
+        // 于是刚清掉的存档立刻又被写回去，用户看到「本地数据已清除」但 localStorage 里还有配置。
+        // 清除的语义是「回到未配置状态」，因此在刷新完界面后把存档再删一次。
+        try {
+            localStorage.removeItem(State.surveyKey);
+        } catch (error) {
+            logWarning('清除配置存档失败', error);
+        }
         setSaveStatus('本地数据已清除', 'saved');
         const cookieText = deviceState.cookies.length
             ? `已清理 Cookie：${deviceState.cookies.join('、')}。`
@@ -3858,9 +3883,20 @@
     function extractQuestionId(node, fallbackOrder) {
         const raw = node.id || node.getAttribute('topic') || '';
         const match = raw.match(/(\d+)/);
-        // fallback 用命名空间前缀避免序号与真实 topic 数字串冲突
-        // fallbackOrder===0 表示临时查询（填写循环/签名），用独立前缀不与配置 ID 碰撞
-        return match ? match[1] : `fallback:${fallbackOrder || 'temp'}`;
+        if (match) {
+            return match[1];
+        }
+        // fallback 用命名空间前缀避免序号与真实 topic 数字串冲突。
+        if (fallbackOrder) {
+            return `fallback:${fallbackOrder}`;
+        }
+        // fallbackOrder===0 是临时查询（填写循环、翻页签名）。
+        // 旧实现直接返回 'fallback:temp'，而扫描时用的是 fallbackOrder=index+1，
+        // 于是这类题扫描存成 fallback:1、填写时算成 fallback:temp，
+        // 永远匹配不到配置 → 被静默跳过；翻页签名也会把多道题压成同一个值。
+        // 这里改用「题目在页面中的稳定序号」，与 scanQuestions 的 index+1 对齐。
+        const index = findQuestionNodes().indexOf(node);
+        return `fallback:${index >= 0 ? index + 1 : 'temp'}`;
     }
 
     function extractTitle(node) {
@@ -4049,10 +4085,36 @@
         return computeIdCardChecksum(text.slice(0, 17)) === text[17].toUpperCase();
     }
 
+    // 数字题的取值范围写在 input 的 minword / maxword 上（真实题：
+    // verify='数字' minword='0' maxword='10'，题面还写着「最大值10」），
+    // 不是标准的 min / max 属性。旧实现只读 min/max，取不到就退化成 0～99999，
+    // 于是「几口人」这类题生成的数字基本都超出范围，提交时被判无效。
+    // 这里按 minword/maxword 优先、min/max 兜底的顺序取边界。
+    function readNumericBound(input, attrNames, fallback) {
+        if (!input) {
+            return fallback;
+        }
+        for (const name of attrNames) {
+            const raw = input.getAttribute ? input.getAttribute(name) : null;
+            if (raw !== null && raw !== undefined && String(raw).trim() !== '') {
+                const parsed = Number(raw);
+                if (Number.isFinite(parsed)) {
+                    return parsed;
+                }
+            }
+        }
+        return fallback;
+    }
+
     function generateValueForRequirement(requirement, input) {
         if (requirement === 'number') {
-            const max = Number(input && input.max) > 0 ? Math.min(Number(input.max), 99999) : 99999;
-            const min = Number.isFinite(Number(input && input.min)) ? Math.max(0, Number(input.min)) : 0;
+            const hasMax = readNumericBound(input, ['maxword', 'max'], NaN);
+            const hasMin = readNumericBound(input, ['minword', 'min'], NaN);
+            const min = Number.isFinite(hasMin) ? Math.max(-99999, Math.floor(hasMin)) : 0;
+            const max = Number.isFinite(hasMax)
+                ? Math.min(Math.floor(hasMax), 99999)
+                : Math.min(Math.max(min, 0) + 99999, 99999);
+            // 边界写反或缺失时以 min 为准，保证 randomInt 的区间合法。
             return String(randomInt(min, Math.max(min, max)));
         }
         if (requirement === 'phone') {
@@ -5419,25 +5481,44 @@
         const defaultMax = Math.min(totalOptions, Math.max(minCount || 1, Math.min(3, totalOptions)));
         const maxCount = Math.max(minCount, Math.min(Number(maxSelections) || defaultMax, totalOptions));
         const count = minCount >= maxCount ? Math.max(1, minCount || 1) : randomInt(minCount || 1, maxCount);
-        const pool = list.map((weight, index) => ({
-            index,
-            weight: Math.max(1, Number(weight) || 1)
-        }));
+        // 权重为 0 表示「用户明确不想选它」。旧实现把每个权重抬成 Math.max(1, w)，
+        // 等于把 0 变成 1，于是 [0,0,0,100] 选 2 项时零权重的选项照样被选中，
+        // 用户配置彻底失效。这里只把负值/非数值归零，0 就保持 0：
+        // 优先从正权重里抽，正权重不足以凑满 count 时才回落到零权重项。
+        const pool = list.map((weight, index) => {
+            const numeric = Number(weight);
+            return {
+                index,
+                weight: Number.isFinite(numeric) && numeric > 0 ? numeric : 0
+            };
+        });
         const results = [];
 
         while (results.length < count && pool.length > 0) {
-            const total = pool.reduce((sum, item) => sum + item.weight, 0);
-            let random = Math.random() * total;
+            const positive = pool.filter((item) => item.weight > 0);
+            const candidates = positive.length ? positive : pool;
+            const total = candidates.reduce((sum, item) => sum + item.weight, 0);
             let selectedIndex = 0;
-            for (let i = 0; i < pool.length; i++) {
-                random -= pool[i].weight;
-                if (random <= 0) {
+            if (total > 0) {
+                let random = Math.random() * total;
+                for (let i = 0; i < candidates.length; i++) {
+                    random -= candidates[i].weight;
+                    if (random < 0) {
+                        selectedIndex = i;
+                        break;
+                    }
                     selectedIndex = i;
-                    break;
                 }
+            } else {
+                // 候选全是零权重：均等随机，至少能凑够最少选择数。
+                selectedIndex = randomInt(0, candidates.length - 1);
             }
-            results.push(pool[selectedIndex].index);
-            pool.splice(selectedIndex, 1);
+            const pick = candidates[selectedIndex];
+            results.push(pick.index);
+            const removeAt = pool.indexOf(pick);
+            if (removeAt >= 0) {
+                pool.splice(removeAt, 1);
+            }
         }
 
         return results;
@@ -6269,12 +6350,28 @@
         });
     }
 
-    function getMatrixQuotaRowIndex(row, fallbackIndex) {
+    // 问卷星的数据行 rowindex 是 0 起的（Qw71Alf / desktop_page / mobile_page 三份真实存档
+    // 里都是 0,1,2,...）。旧实现把它当 1 起做 `parsed - 1`，等于把所有行号整体前移一格：
+    // 0 和 1 都映射到配额行 0，第 1、2 行共用同一行配额，最后一行永远用不到自己的配额。
+    // 现在按整题的基准值换算：整题最小 rowindex 为 0 就是 0 起，为 1 就是 1 起。
+    // 这样既修正了 0 起，也不会把历史 1 起页面（若存在）算错。
+    function getMatrixRowIndexBase(rows) {
+        const values = (rows || [])
+            .map((row) => Number(row.getAttribute('rowindex')))
+            .filter((value) => Number.isFinite(value));
+        if (!values.length) {
+            return 0;
+        }
+        return Math.min.apply(null, values) >= 1 ? 1 : 0;
+    }
+
+    function getMatrixQuotaRowIndex(row, fallbackIndex, base) {
+        const offset = base === 1 ? 1 : 0;
         const raw = row.getAttribute('rowindex');
         if (raw !== null && raw !== '') {
             const parsed = Number(raw);
             if (Number.isFinite(parsed)) {
-                return Math.max(0, Math.floor(parsed > 0 ? parsed - 1 : parsed));
+                return Math.max(0, Math.floor(parsed) - offset);
             }
         }
         return fallbackIndex;
@@ -6308,6 +6405,7 @@
 
     function fillMatrix(node, question) {
         const rows = getMatrixDataRows(node);
+        const rowIndexBase = getMatrixRowIndexBase(rows);
         let attempted = 0;
         let succeeded = 0;
         rows.forEach((row, domIndex) => {
@@ -6317,7 +6415,7 @@
                 return;
             }
             attempted += 1;
-            const quotaRowIndex = getMatrixQuotaRowIndex(row, domIndex);
+            const quotaRowIndex = getMatrixQuotaRowIndex(row, domIndex, rowIndexBase);
             const index = pickMatrixRowIndex(question, quotaRowIndex);
             const options = getMatrixRowOptions(row);
             if (!options[index]) {

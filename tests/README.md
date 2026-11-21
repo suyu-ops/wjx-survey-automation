@@ -15,14 +15,15 @@ WebSocket，不引 puppeteer、不引 jsdom——少一层依赖，就少一层�
 ## 运行
 
 ```bash
-node tests/unit.test.js          # 65 项：纯函数与算法不变量
+node tests/unit.test.js          # 81 项：纯函数与算法不变量
 node tests/integration.test.js   # 26 项：真 Chrome + 复刻的 WJX DOM/事件契约
 node tests/robustness.test.js    # 11 项：空页面、畸形 DOM、缺属性、XSS 载荷
 node tests/lifecycle.test.js     # 15 项：会话状态机、配额快照回滚
 node tests/pagination.test.js    # 44 项：分页不丢配置、一键随机覆盖全页
+node tests/persist.test.js       # 9 项：份数刷新不被覆盖、清除后不被写回
 ```
 
-合计 **161 项断言**。
+合计 **186 项断言**。
 
 ## 性能对照（可选）
 
